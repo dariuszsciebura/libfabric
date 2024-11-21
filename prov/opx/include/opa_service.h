@@ -6,7 +6,7 @@
   GPL LICENSE SUMMARY
 
   Copyright(c) 2015 Intel Corporation.
-  Copyright(c) 2021 Cornelis Networks.
+  Copyright(c) 2021-2024 Cornelis Networks.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of version 2 of the GNU General Public License as
@@ -17,13 +17,10 @@
   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
   General Public License for more details.
 
-  Contact Information:
-  Intel Corporation, www.intel.com
-
   BSD LICENSE
 
   Copyright(c) 2015 Intel Corporation.
-  Copyright(c) 2021 Cornelis Networks.
+  Copyright(c) 2021-2024 Cornelis Networks.
 
   Redistribution and use in source and binary forms, with or without
   modification, are permitted provided that the following conditions
@@ -68,7 +65,8 @@
 
 /* upper and lower bounds for HFI port numbers */
 #define OPX_MIN_PORT 1
-#define OPX_MAX_PORT 1
+/* Be aware this is the JKR max. Current WFR code handles it. */
+#define OPX_MAX_PORT 2	// JKR max is 2, WFR is 1
 #ifndef OPX_NUM_PORTS_GEN1
 #define OPX_NUM_PORTS_GEN1 (OPX_MAX_PORT - OPX_MIN_PORT + 1)
 #endif
@@ -93,6 +91,7 @@
 /* base name of path (without unit #) for opa driver */
 #define OPX_DEVICE_PATH "/dev/hfi1"
 #define OPX_CLASS_PATH "/sys/class/infiniband/hfi1"
+#define OPX_CLASS_DIR_PATH "/sys/class/infiniband"
 
 /* Commands used to communicate with driver. */
 enum OPX_HFI_CMD {
@@ -110,8 +109,8 @@ enum OPX_HFI_CMD {
     OPX_HFI_CMD_TID_INVAL_READ,    /* read TID cache invalidations */
     OPX_HFI_CMD_GET_VERS,          /* get the version of the user cdev */
 
-#ifdef PSM_CUDA
-    OPX_HFI_CMD_TID_UPDATE_V2 = 28,
+#ifdef OPX_HMEM
+    OPX_HFI_CMD_TID_UPDATE_V3,
 #endif
     OPX_HFI_CMD_LAST,
 };
@@ -182,13 +181,19 @@ int opx_hfi_get_port_index2pkey(int unit, int port, int index);
    Returns -1 with errno set, or number of units >=0 (0 means none found). */
 int opx_hfi_get_num_units();
 
+/* get the number of ports per hfi unit */
+/* should return OPX_MAX_PORT if number of ports is greater than OPX_MAX_PORT*/
+/* should return 0 if number of ports is less than OPX_MIN_PORT*/
+int opx_hfi_get_num_ports(int hfi_unit);
+
 /* Given a unit number, returns 1 if any port on the unit is active.
    returns 0 if no port on the unit is active.
    returns -1 when an error occurred. */
 int opx_hfi_get_unit_active(int unit);
 
-/* get the number of contexts from the unit id. */
-int opx_hfi_get_num_contexts(int unit);
+/* Get the number of free contexts from the unit id. */
+/* Returns 0 if no unit or no match. */
+int opx_hfi_get_num_free_contexts(int unit);
 
 /* Open hfi device file, return -1 on error. */
 int opx_hfi_context_open(int unit, int port, uint64_t open_timeout);

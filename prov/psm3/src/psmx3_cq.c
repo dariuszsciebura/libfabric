@@ -622,8 +622,10 @@ psmx3_mq_status_copy(struct psm2_mq_req_user *req, void *status_array, int entry
 			data = PSMX3_GET_CQDATA(PSMX3_STATUS_TAG(req));
 			if (PSMX3_HAS_IMM(PSMX3_GET_FLAGS(PSMX3_STATUS_TAG(req))))
 				flags |= FI_REMOTE_CQ_DATA;
-			if (multi_recv_req->offset + PSMX3_STATUS_RCVLEN(req) +
-				multi_recv_req->min_buf_size > multi_recv_req->len)
+			len_remaining = multi_recv_req->len - multi_recv_req->offset -
+					PSMX3_STATUS_RCVLEN(req);
+			if (len_remaining < multi_recv_req->min_buf_size ||
+			    len_remaining == 0)
 				flags |= FI_MULTI_RECV;	/* buffer used up */
 			err = psmx3_cq_rx_complete(
 					status_data->poll_cq, ep->recv_cq, ep->av,
@@ -638,7 +640,8 @@ psmx3_mq_status_copy(struct psm2_mq_req_user *req, void *status_array, int entry
 		/* repost multi-recv buffer */
 		multi_recv_req->offset += PSMX3_STATUS_RCVLEN(req);
 		len_remaining = multi_recv_req->len - multi_recv_req->offset;
-		if (len_remaining >= multi_recv_req->min_buf_size) {
+		if (len_remaining >= multi_recv_req->min_buf_size &&
+		    len_remaining > 0) {
 			if (len_remaining > PSMX3_MAX_MSG_SIZE)
 				len_remaining = PSMX3_MAX_MSG_SIZE;
 			err = psm3_mq_irecv2(ep->rx->psm2_mq,
@@ -786,7 +789,8 @@ psmx3_mq_status_copy(struct psm2_mq_req_user *req, void *status_array, int entry
 			multi_recv_req = PSMX3_CTXT_USER(fi_context);
 			multi_recv_req->offset += PSMX3_STATUS_RCVLEN(req);
 			len_remaining = multi_recv_req->len - multi_recv_req->offset;
-			if (len_remaining >= multi_recv_req->min_buf_size) {
+			if (len_remaining >= multi_recv_req->min_buf_size &&
+			    len_remaining > 0) {
 				if (len_remaining > PSMX3_MAX_MSG_SIZE)
 					len_remaining = PSMX3_MAX_MSG_SIZE;
 				err = psm3_mq_irecv2(ep->rx->psm2_mq,
@@ -963,7 +967,7 @@ STATIC ssize_t psmx3_cq_readerr(struct fid_cq *cq, struct fi_cq_err_entry *buf,
 				  buf, &cq_priv->pending_error->cqe.err);
 		free(cq_priv->pending_error);
 		cq_priv->pending_error = NULL;
-		psmx3_unlock(&cq_priv->lock, 2);
+		cq_priv->domain->cq_unlock_fn(&cq_priv->lock, 2);
 		return 1;
 	}
 	cq_priv->domain->cq_unlock_fn(&cq_priv->lock, 2);
@@ -998,7 +1002,7 @@ STATIC ssize_t psmx3_cq_sreadfrom(struct fid_cq *cq, void *buf, size_t count,
 				ofi_atomic_set32(&cq_priv->signaled, 0);
 				return -FI_ECANCELED;
 			}
-			ssize_t wait_result = fi_wait((struct fid_wait *)cq_priv->wait, timeout);
+			ssize_t wait_result = ofi_wait((struct fid_wait *)cq_priv->wait, timeout);
 			if (wait_result != FI_SUCCESS) {
 				return wait_result;
 			}
@@ -1107,7 +1111,7 @@ static int psmx3_cq_close(fid_t fid)
 	ofi_spin_destroy(&cq->lock);
 
 	if (cq->wait) {
-		fi_poll_del(&cq->wait->pollset->poll_fid, &cq->cq.fid, 0);
+		ofi_poll_del(&cq->wait->pollset->poll_fid, &cq->cq.fid, 0);
 		if (cq->wait_is_local)
 			fi_close(&cq->wait->wait_fid.fid);
 	}
@@ -1227,8 +1231,8 @@ int psmx3_cq_open(struct fid_domain *domain, struct fi_cq_attr *attr,
 	case FI_WAIT_MUTEX_COND:
 		wait_attr.wait_obj = attr->wait_obj;
 		wait_attr.flags = 0;
-		err = fi_wait_open(&domain_priv->fabric->util_fabric.fabric_fid,
-				   &wait_attr, (struct fid_wait **)&wait);
+		err = ofi_wait_open(&domain_priv->fabric->util_fabric.fabric_fid,
+				    &wait_attr, (struct fid_wait **)&wait);
 		if (err)
 			return err;
 		wait_is_local = 1;
@@ -1295,7 +1299,7 @@ int psmx3_cq_open(struct fid_domain *domain, struct fi_cq_attr *attr,
 	}
 
 	if (wait)
-		fi_poll_add(&cq_priv->wait->pollset->poll_fid, &cq_priv->cq.fid, 0);
+		ofi_poll_add(&cq_priv->wait->pollset->poll_fid, &cq_priv->cq.fid, 0);
 
 	*cq = &cq_priv->cq;
 	return 0;

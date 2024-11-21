@@ -68,6 +68,12 @@ uint32_t efa_mock_ibv_read_opcode_return_mock(struct ibv_cq_ex *current);
 
 uint32_t efa_mock_ibv_read_vendor_err_return_mock(struct ibv_cq_ex *current);
 
+uint32_t efa_mock_ibv_read_qp_num_return_mock(struct ibv_cq_ex *current);
+
+uint32_t efa_mock_ibv_read_wc_flags_return_mock(struct ibv_cq_ex *current);
+
+bool efa_mock_efadv_wc_is_unsolicited(struct efadv_cq *efadv_cq);
+
 ssize_t __real_ofi_copy_from_hmem_iov(void *dest, size_t size,
 				      enum fi_hmem_iface hmem_iface, uint64_t device,
 				      const struct iovec *hmem_iov,
@@ -78,6 +84,14 @@ ssize_t efa_mock_ofi_copy_from_hmem_iov_inc_counter(void *dest, size_t size,
 						    enum fi_hmem_iface hmem_iface, uint64_t device,
 						    const struct iovec *hmem_iov,
 						    size_t hmem_iov_count, uint64_t hmem_iov_offset);
+
+int __real_efa_rdm_pke_read(struct efa_rdm_ope *ope);
+
+bool __real_efa_device_support_unsolicited_write_recv();
+
+int efa_mock_efa_rdm_pke_read_return_mock(struct efa_rdm_ope *ope);
+
+bool efa_mock_efa_device_support_unsolicited_write_recv(void);
 
 struct efa_unit_test_mocks
 {
@@ -99,15 +113,27 @@ struct efa_unit_test_mocks
 	void *(*neuron_alloc)(void **handle, size_t size);
 #endif
 
+#if HAVE_CUDA
+	cudaError_t (*ofi_cudaMalloc)(void **ptr, size_t size);
+#endif
+
 	ssize_t (*ofi_copy_from_hmem_iov)(void *dest, size_t size,
 					  enum fi_hmem_iface hmem_iface, uint64_t device,
 					  const struct iovec *hmem_iov,
 					  size_t hmem_iov_count, uint64_t hmem_iov_offset);
 
+	int (*efa_rdm_pke_read)(struct efa_rdm_ope *ope);
+
+	bool (*efa_device_support_unsolicited_write_recv)(void);
+
 	enum ibv_fork_status (*ibv_is_fork_initialized)(void);
 
 #if HAVE_EFADV_QUERY_MR
 	int (*efadv_query_mr)(struct ibv_mr *ibv_mr, struct efadv_mr_attr *attr, uint32_t inlen);
+#endif
+
+#if HAVE_EFA_DATA_IN_ORDER_ALIGNED_128_BYTES
+	int (*ibv_query_qp_data_in_order)(struct ibv_qp *qp, enum ibv_wr_opcode op, uint32_t flags);
 #endif
 };
 
@@ -139,6 +165,12 @@ struct ibv_cq_ex *efa_mock_efadv_create_cq_set_eopnotsupp_and_return_null(struct
 #if HAVE_NEURON
 void *__real_neuron_alloc(void **handle, size_t size);
 void *efa_mock_neuron_alloc_return_null(void **handle, size_t size);
+void *efa_mock_neuron_alloc_return_mock(void **handle, size_t size);
+#endif
+
+#if HAVE_CUDA
+cudaError_t __real_ofi_cudaMalloc(void **ptr, size_t size);
+cudaError_t efa_mock_ofi_cudaMalloc_return_mock(void **ptr, size_t size);
 #endif
 
 #if HAVE_EFADV_QUERY_MR
@@ -147,6 +179,12 @@ int efa_mock_efadv_query_mr_recv_ic_id_0(struct ibv_mr *ibv_mr, struct efadv_mr_
 int efa_mock_efadv_query_mr_rdma_read_ic_id_1(struct ibv_mr *ibv_mr, struct efadv_mr_attr *attr, uint32_t inlen);
 int efa_mock_efadv_query_mr_rdma_recv_ic_id_2(struct ibv_mr *ibv_mr, struct efadv_mr_attr *attr, uint32_t inlen);
 int efa_mock_efadv_query_mr_recv_and_rdma_read_ic_id_0_1(struct ibv_mr *ibv_mr, struct efadv_mr_attr *attr, uint32_t inlen);
+#endif
+
+#if HAVE_EFA_DATA_IN_ORDER_ALIGNED_128_BYTES
+int __real_ibv_query_qp_data_in_order(struct ibv_qp *qp, enum ibv_wr_opcode op, uint32_t flags);
+int efa_mock_ibv_query_qp_data_in_order_return_0(struct ibv_qp *qp, enum ibv_wr_opcode op, uint32_t flags);
+int efa_mock_ibv_query_qp_data_in_order_return_in_order_aligned_128_bytes(struct ibv_qp *qp, enum ibv_wr_opcode op, uint32_t flags);
 #endif
 
 enum ibv_fork_status __real_ibv_is_fork_initialized(void);

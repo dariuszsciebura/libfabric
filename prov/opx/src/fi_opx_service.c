@@ -6,7 +6,7 @@
   GPL LICENSE SUMMARY
 
   Copyright(c) 2015 Intel Corporation.
-  Copyright(c) 2021-2022 Cornelis Networks.
+  Copyright(c) 2021-2024 Cornelis Networks.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of version 2 of the GNU General Public License as
@@ -23,7 +23,7 @@
   BSD LICENSE
 
   Copyright(c) 2015 Intel Corporation.
-  Copyright(c) 2021-2022 Cornelis Networks.
+  Copyright(c) 2021-2024 Cornelis Networks.
 
   Redistribution and use in source and binary forms, with or without
   modification, are permitted provided that the following conditions
@@ -345,8 +345,8 @@ int _hfi_cmd_ioctl(int fd, struct hfi1_cmd *cmd, size_t count)
         [OPX_HFI_CMD_CTXT_RESET]       = {HFI1_IOCTL_CTXT_RESET    , 1},
         [OPX_HFI_CMD_TID_INVAL_READ]   = {HFI1_IOCTL_TID_INVAL_READ, 0},
         [OPX_HFI_CMD_GET_VERS]         = {HFI1_IOCTL_GET_VERS      , 1},
-#ifdef PSM_CUDA
-	[OPX_HFI_CMD_TID_UPDATE_V2]	= {HFI1_IOCTL_TID_UPDATE_V2 , 0},
+#ifdef OPX_HMEM
+	[OPX_HFI_CMD_TID_UPDATE_V3]	= {HFI1_IOCTL_TID_UPDATE_V3 , 0},
 #endif
     };
         _HFI_INFO("command OPX_HFI_CMD %#X, HFI1_IOCTL %#X\n",cmd->type, cmdTypeToIoctlNum[cmd->type].ioctlCmd);
@@ -407,6 +407,42 @@ int opx_hfi_get_num_units(void)
 	return ret;
 }
 
+/* get the number of ports per hfi unit */
+/* should return OPX_MAX_PORT if number of ports is greater than OPX_MAX_PORT*/
+/* should return 0 if number of ports is less than OPX_MIN_PORT*/
+int opx_hfi_get_num_ports(int hfi_unit) {
+	char path[256];
+	snprintf(path, sizeof(path), "%s_%d/ports/", OPX_CLASS_PATH, hfi_unit);
+	DIR* dir = opendir(path);
+	if (!dir) {
+		FI_WARN(fi_opx_global.prov, FI_LOG_EP_DATA, "Failed to open directory to read the number of ports on HFI unit %d. \n", hfi_unit);
+		return 0;
+	}
+
+	struct dirent* entry;
+	int port_count = 0;
+
+	while ((entry = readdir(dir)) != NULL) {
+		if (entry->d_type == DT_DIR && isdigit(entry->d_name[0])) {
+			port_count++;
+		}
+	}
+
+	closedir(dir);
+
+	if (port_count < OPX_MIN_PORT) {
+		FI_WARN(fi_opx_global.prov, FI_LOG_EP_DATA, "Number of ports should be greater than or equal to OPX_MIN_PORT. \n");
+		return 0;	
+	}
+
+	if (port_count > OPX_MAX_PORT) {
+		FI_WARN(fi_opx_global.prov, FI_LOG_EP_DATA, "Number of ports should be less than or equal to OPX_MAX_PORT. \n");
+		return OPX_MAX_PORT;	
+	}
+
+	return port_count;
+}
+
 /* Given a unit number, returns 1 if any port on the unit is active.
    returns 0 if no port on the unit is active. */
 int opx_hfi_get_unit_active(int unit)
@@ -425,43 +461,23 @@ int opx_hfi_get_unit_active(int unit)
 	return (rv>0);
 }
 
-/* get the number of contexts from the unit id. */
+/* Get the number of free contexts from the unit id. */
 /* Returns 0 if no unit or no match. */
-int opx_hfi_get_num_contexts(int unit_id)
+int opx_hfi_get_num_free_contexts(int unit_id)
 {
-	int n = 0;
-	int units;
 	int64_t val;
 	uint32_t p = OPX_MIN_PORT;
 
-	units = opx_hfi_get_num_units();
+	for (; p <= OPX_MAX_PORT; p++)
+		if (opx_hfi_get_port_lid(unit_id, p) > 0)
+			break;
 
-	if_pf(units <=  0)
-		return 0;
-
-	if (unit_id == OPX_UNIT_ID_ANY) {
-		uint32_t u;
-
-		for (u = 0; u < units; u++) {
-			for (p = OPX_MIN_PORT; p <= OPX_MAX_PORT; p++)
-				if (opx_hfi_get_port_lid(u, p) > 0)
-					break;
-
-			if (p <= OPX_MAX_PORT &&
-			    !opx_sysfs_unit_read_s64(u, "nctxts", &val, 0))
-				n += (uint32_t) val;
-		}
-	} else {
-		for (; p <= OPX_MAX_PORT; p++)
-			if (opx_hfi_get_port_lid(unit_id, p) > 0)
-				break;
-
-		if (p <= OPX_MAX_PORT &&
-		    !opx_sysfs_unit_read_s64(unit_id, "nctxts", &val, 0))
-			n += (uint32_t) val;
+	if (p <= OPX_MAX_PORT &&
+			!opx_sysfs_unit_read_s64(unit_id, "nfreectxts", &val, 0)) {
+		return (uint32_t) val;
 	}
 
-	return n;
+	return 0;
 }
 
 /* Given a unit number and port number, returns 1 if the unit and port are active.
@@ -506,13 +522,14 @@ int opx_hfi_get_port_lid(int unit, int port)
 {
 	int ret;
 	int64_t val;
+	_HFI_DBG("%s unit %d, port %d\n", __func__, unit, port);
 
 	if (opx_hfi_get_port_active(unit,port) != 1)
 		return -2;
+
 	ret = opx_sysfs_port_read_s64(unit, port, "lid", &val, 0);
 	_HFI_VDBG("opx_hfi_get_port_lid: ret %d, unit %d port %d val=%ld\n", ret, unit,
 		  port, val);
-
 	if (ret == -1) {
 		if (errno == ENODEV)
 			/* this is "normal" for port != 1, on single port chips */
@@ -537,6 +554,7 @@ int opx_hfi_get_port_gid(int unit, int port, uint64_t *hi, uint64_t *lo)
 {
 	int ret;
 	char *gid_str = NULL;
+	_HFI_DBG("%s unit %d, port %d\n", __func__, unit, port);
 
 	ret = opx_sysfs_port_read(unit, port, "gids/0", &gid_str);
 
@@ -630,6 +648,7 @@ int opx_hfi_get_port_sl2sc(int unit, int port, int sl)
 	int ret;
 	int64_t val;
 	char sl2scpath[16];
+	_HFI_DBG("%s unit %d, port %d\n", __func__, unit, port);
 
 	snprintf(sl2scpath, sizeof(sl2scpath), "sl2sc/%d", sl);
 	ret = opx_sysfs_port_read_s64(unit, port, sl2scpath, &val, 0);
@@ -652,6 +671,7 @@ int opx_hfi_get_port_sc2vl(int unit, int port, int sc)
 	int ret;
 	int64_t val;
 	char sc2vlpath[16];
+	_HFI_DBG("%s unit %d, port %d\n", __func__, unit, port);
 
 	snprintf(sc2vlpath, sizeof(sc2vlpath), "sc2vl/%d", sc);
 	ret = opx_sysfs_port_read_s64(unit, port, sc2vlpath, &val, 0);
@@ -674,6 +694,7 @@ int opx_hfi_get_port_vl2mtu(int unit, int port, int vl)
 	int ret;
 	int64_t val;
 	char vl2mtupath[16];
+	_HFI_DBG("%s unit %d, port %d\n", __func__, unit, port);
 
 	snprintf(vl2mtupath, sizeof(vl2mtupath), "vl2mtu/%d", vl);
 	ret = opx_sysfs_port_read_s64(unit, port, vl2mtupath, &val, 0);
@@ -834,4 +855,65 @@ int opx_hfi_get_hfi1_count() {
 		}
 	}
 	return hfi1_count;
+}
+
+/**
+ * @brief Reset the HFI context.
+ *
+ * This function resets the HFI context by sending a command to the specified file descriptor.
+ * The command type is set to OPX_HFI_CMD_CTXT_RESET and the command length and address are set to 0.
+ * If the command write fails, the function will retry if the error is ENOLCK.
+ * If the error is not EINVAL, a warning message will be printed.
+ *
+ * @param fd The file descriptor to send the command to.
+ * @return 0 on success, -1 on failure.
+ */
+int opx_hfi_reset_context(int fd)
+{
+	struct hfi1_cmd cmd;
+
+	cmd.type = OPX_HFI_CMD_CTXT_RESET;
+	cmd.len = 0;
+	cmd.addr = 0;
+
+retry:
+	if (opx_hfi_cmd_write(fd, &cmd, sizeof(cmd)) == -1) {
+		if (errno == ENOLCK)
+			goto retry;
+
+		if (errno != EINVAL)
+			_HFI_INFO("reset ctxt failed: %s\n", strerror(errno));
+
+		return -1;
+	}
+	return 0;
+}
+
+/**
+ * @brief Acknowledge events for the HFI.
+ *
+ * This function sends an acknowledgment for events to the HFI.
+ *
+ * @param fd The file descriptor for the HFI control.
+ * @param ackbits The bits to be acknowledged.
+ * @return 0 on success, -1 on failure.
+ */
+int opx_hfi_ack_events(int fd, uint64_t ackbits)
+{
+	struct hfi1_cmd cmd;
+
+	cmd.type = OPX_HFI_CMD_ACK_EVENT;
+	cmd.len = 0;
+	cmd.addr = ackbits;
+
+retry:
+	if (opx_hfi_cmd_write(fd, &cmd, sizeof(cmd)) == -1) {
+		if (errno == ENOLCK)
+			goto retry;
+
+		if (errno != EINVAL)
+			_HFI_INFO("ack event failed: %s\n", strerror(errno));
+		return -1;
+	}
+	return 0;
 }

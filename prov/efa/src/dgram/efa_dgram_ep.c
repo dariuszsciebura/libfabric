@@ -282,7 +282,7 @@ static struct fi_ops efa_dgram_ep_ops = {
 static void efa_dgram_ep_progress_internal(struct efa_dgram_ep *ep, struct efa_dgram_cq *efa_dgram_cq)
 {
 	struct util_cq *cq;
-	struct fi_cq_tagged_entry cq_entry[efa_dgram_cq_PROGRESS_ENTRIES];
+	struct fi_cq_tagged_entry cq_entry[efa_dgram_cq_PROGRESS_ENTRIES] = {0};
 	struct fi_cq_tagged_entry *temp_cq_entry;
 	struct fi_cq_err_entry cq_err_entry = {0};
 	fi_addr_t src_addr[efa_dgram_cq_PROGRESS_ENTRIES];
@@ -303,7 +303,7 @@ static void efa_dgram_ep_progress_internal(struct efa_dgram_ep *ep, struct efa_d
 	if (OFI_UNLIKELY(ret < 0)) {
 		if (OFI_UNLIKELY(ret != -FI_EAVAIL)) {
 			EFA_WARN(FI_LOG_CQ, "no error available errno: %ld\n", ret);
-			efa_base_ep_write_eq_error(&ep->base_ep, FI_EIO, FI_EFA_ERR_DGRAM_CQ_READ);
+			efa_base_ep_write_eq_error(&ep->base_ep, -ret, FI_EFA_ERR_DGRAM_CQ_READ);
 			return;
 		}
 

@@ -229,6 +229,18 @@ CXI integrated launcher and CXI authorization key aware libfabric user:
 7. Application processes select from the list of available service IDs and VNIs
    to form an authorization key to use for Endpoint allocation.
 
+## Endpoint Protocols
+
+The provider supports multiple endpoint protocols. The default protocol is
+FI_PROTO_CXI and fully supports the messaging requirements of parallel
+applicaitons.
+
+The FI_PROTO_CXI_RNR endpoint protocol is an optional protocol that targets
+client/server environments where send-after-send ordering is not required and
+messaging is generally to pre-posted buffers; FI_MULTI_RECV is recommended.
+It utilizes a receiver-not-ready implementation where
+*FI_CXI_RNR_MAX_TIMEOUT_US* can be tuned to control the maximum retry duration.
+
 ## Address Vectors
 
 The CXI provider supports both *FI_AV_TABLE* and *FI_AV_MAP* with the same
@@ -432,6 +444,15 @@ physical memory. Using Pinned mode avoids any overhead due to network page
 faults but requires all buffers to be backed by physical memory. Copy-on-write
 semantics are broken when using pinned memory. See the Fork section for more
 information.
+
+The CXI provider supports DMABUF for device memory registration.
+DMABUF is supported in ROCm 5.6+ and Cuda 11.7+ with nvidia open source driver
+525+.
+Both *FI_HMEM_ROCR_USE_DMABUF* and *FI_HMEM_CUDA_USE_DMABUF are disabled by
+default in libfabric core but the CXI provider enables
+*FI_HMEM_ROCR_USE_DMABUF* by default if not specifically set.
+There may be situations with CUDA that may double the BAR consumption.
+Until this is fixed in the CUDA stack, CUDA DMABUF will be disabled by default.
 
 ## Translation Cache
 
@@ -1077,6 +1098,12 @@ The CXI provider checks for the following environment variables:
 *FI_CXI_DEFAULT_VNI*
 :   Default VNI value used only for service IDs where the VNI is not restricted.
 
+*FI_CXI_RNR_MAX_TIMEOUT_US*
+:   When using the endpoint FI_PROTO_CXI_RNR protocol, this setting is used to
+    control the maximum time from the original posting of the message that the
+    message should be retried. A value of 0 will return an error completion
+    on the first RNR ack status.
+
 *FI_CXI_EQ_ACK_BATCH_SIZE*
 :   Number of EQ events to process before writing an acknowledgement to HW.
     Batching ACKs amortizes the cost of event acknowledgement over multiple
@@ -1267,6 +1294,17 @@ The CXI provider checks for the following environment variables:
 :   Enable enforcement of triggered operation limit. Doing this can prevent
     fi_control(FI_QUEUE_WORK) deadlocking at the cost of performance.
 
+*FI_CXI_MR_CACHE_EVENTS_DISABLE_POLL_NSECS*
+:   Max amount of time to poll when disabling an MR configured with MR match events.
+
+*FI_CXI_MR_CACHE_EVENTS_DISABLE_LE_POLL_NSECS*
+:   Max amount of time to poll when LE invalidate disabling an MR configured with MR
+    match events.
+
+*FI_CXI_FORCE_DEV_REG_COPY*
+:   Force the CXI provider to use the HMEM device register copy routines. If not
+    supported, RDMA operations or memory registration will fail.
+
 Note: Use the fi_info utility to query provider environment variables:
 <code>fi_info -p cxi -e</code>
 
@@ -1346,10 +1384,9 @@ struct fi_cxi_dom_ops {
 };
 ```
 
-*cntr_read* extension is used to read hardware counter values. Valid values
-of the cntr argument are found in the Cassini-specific header file
-cassini_cntr_defs.h. Note that Counter accesses by applications may be
-rate-limited to 1HZ.
+*cntr_read* extension is used to read Cassini Telemetry items that consists of
+counters and gauges.  The items available and their content are dependent upon
+the Cassini ASIC version and Cassini Driver version.
 
 *topology* extension is used to return CXI NIC address topology information
 for the domain. Currently only a dragonfly fabric topology is reported.
@@ -1551,7 +1588,7 @@ To enable PCIe fetch add for libfabric, the following CXI driver kernel module
 parameter must be set to non-zero.
 
 ```
-/sys/module/cxi_core/parameters/amo_remap_to_pcie_fadd
+/sys/module/cxi_ss1/parameters/amo_remap_to_pcie_fadd
 ```
 
 The following are the possible values for this kernel module and the impact of

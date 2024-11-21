@@ -42,7 +42,8 @@ struct fi_info *fi_dupinfo(const struct fi_info *info);
 
 *hints*
 : Reference to an fi_info structure that specifies criteria for
-  selecting the returned fabric information.
+  selecting the returned fabric information.  The fi_info hints
+  structure must be allocated using either fi_allocinfo() or fi_dupinfo().
 
 *info*
 : A pointer to a linked list of fi_info structures containing response
@@ -275,7 +276,7 @@ additional optimizations.
 : Requests that the provider support the association of a user specified
   identifier with each address vector (AV) address.  User identifiers are
   returned with completion data in place of the AV address.  See
-  [`fi_domain`(3)](fi_domain.3.html) and [`fi_av`(3)] (fi_av.3.html) for
+  [`fi_domain`(3)](fi_domain.3.html) and [`fi_av`(3)](fi_av.3.html) for
   more details.
 
 *FI_COLLECTIVE*
@@ -288,6 +289,17 @@ additional optimizations.
   an incoming message when matching it with a receive buffer.  If this
   capability is not set, then the src_addr parameter for msg and tagged
   receive operations is ignored.
+
+*FI_TAGGED_DIRECTED_RECV*
+: Similar to FI_DIRECTED_RECV, but only applies to tagged receive
+  operations.
+
+*FI_EXACT_DIRECTED_RECV*
+: Similar to FI_DIRECTED_RECV, but requires the source address to be
+  exact, i.e., FI_ADDR_UNSPEC is not allowed. This capability can
+  be used alone, or in conjunction with FI_DIRECTED_RECV or
+  FI_TAGGED_DIRECTED_RECV as a modifier to disallow FI_ADDR_UNSPEC
+  being used as the source address.
 
 *FI_FENCE*
 : Indicates that the endpoint support the FI_FENCE flag on data
@@ -332,10 +344,19 @@ additional optimizations.
 : Specifies that the endpoint must support the FI_MULTI_RECV flag when
   posting receive buffers.
 
+*FI_TAGGED_MULTI_RECV*
+: Specifies that the endpoint must support the FI_MULTI_RECV flag when
+  posting tagged receive buffers.
+
 *FI_NAMED_RX_CTX*
 : Requests that endpoints which support multiple receive contexts
   allow an initiator to target (or name) a specific receive context as
   part of a data transfer operation.
+
+*FI_PEER*
+: Specifies that the provider must support being used as a peer provider in
+  the peer API flow. The provider must support importing owner_ops when opening
+  a CQ, counter, and shared receive queue.
 
 *FI_READ*
 : Indicates that the user requires an endpoint capable of initiating
@@ -429,16 +450,6 @@ additional optimizations.
   Endpoints support this capability must meet the usage model as
   described by [`fi_trigger`(3)](fi_trigger.3.html).
 
-*FI_VARIABLE_MSG*
-
-: Requests that the provider must notify a receiver when a variable
-  length message is ready to be received prior to attempting to place
-  the data.  Such notification will include the size of the message and
-  any associated message tag (for FI_TAGGED).  See 'Variable Length
-  Messages' in fi_msg.3 for full details.  Variable length messages
-  are any messages larger than an endpoint configurable size.  This
-  flag requires that FI_MSG and/or FI_TAGGED be set.
-
 *FI_WRITE*
 : Indicates that the user requires an endpoint capable of initiating
   writes against remote memory regions.  This flag requires that FI_RMA
@@ -466,14 +477,15 @@ may optionally report non-selected secondary capabilities if doing so
 would not compromise performance or security.
 
 Primary capabilities: FI_MSG, FI_RMA, FI_TAGGED, FI_ATOMIC, FI_MULTICAST,
-FI_NAMED_RX_CTX, FI_DIRECTED_RECV, FI_VARIABLE_MSG, FI_HMEM, FI_COLLECTIVE,
-FI_XPU, FI_AV_USER_ID
+FI_NAMED_RX_CTX, FI_DIRECTED_RECV, FI_TAGGED_DIRECTED_RECV, FI_HMEM,
+FI_COLLECTIVE, FI_XPU, FI_AV_USER_ID, FI_PEER
 
 Primary modifiers: FI_READ, FI_WRITE, FI_RECV, FI_SEND,
 FI_REMOTE_READ, FI_REMOTE_WRITE
 
-Secondary capabilities: FI_MULTI_RECV, FI_SOURCE, FI_RMA_EVENT, FI_SHARED_AV,
-FI_TRIGGER, FI_FENCE, FI_LOCAL_COMM, FI_REMOTE_COMM, FI_SOURCE_ERR, FI_RMA_PMEM.
+Secondary capabilities: FI_MULTI_RECV, FI_TAGGED_MULTI_RECV, FI_SOURCE,
+FI_RMA_EVENT, FI_SHARED_AV, FI_TRIGGER, FI_FENCE, FI_LOCAL_COMM,
+FI_REMOTE_COMM, FI_SOURCE_ERR, FI_RMA_PMEM.
 
 # MODE
 
@@ -506,17 +518,6 @@ supported set of modes will be returned in the info structure(s).
   related memory descriptor array, until the associated
   operation has completed.
 
-*FI_BUFFERED_RECV*
-: The buffered receive mode bit indicates that the provider owns the
-  data buffer(s) that are accessed by the networking layer for received
-  messages.  Typically, this implies that data must be copied from the
-  provider buffer into the application buffer.  Applications that can
-  handle message processing from network allocated data buffers can set
-  this mode bit to avoid copies.  For full details on application
-  requirements to support this mode, see the 'Buffered Receives' section
-  in [`fi_msg`(3)](fi_msg.3.html).  This mode bit applies to FI_MSG and
-  FI_TAGGED receive operations.
-
 *FI_CONTEXT*
 : Specifies that the provider requires that applications use struct
   fi_context as their per operation context parameter for operations
@@ -547,7 +548,7 @@ supported set of modes will be returned in the info structure(s).
   The requirements for using struct fi_context2 are identical as
   defined for FI_CONTEXT above.
 
-*FI_LOCAL_MR*
+*FI_LOCAL_MR* (deprecated)
 : The provider is optimized around having applications register memory
   for locally accessed data buffers.  Data buffers used in send and
   receive operations and as the source buffer for RMA and atomic
@@ -592,20 +593,6 @@ supported set of modes will be returned in the info structure(s).
   payload).  For scatter-gather send/recv operations, the prefix buffer
   must be a contiguous region, though it may or may not be directly
   adjacent to the payload portion of the buffer.
-
-*FI_NOTIFY_FLAGS_ONLY*
-: This bit indicates that general completion flags may not be set by
-  the provider, and are not needed by the application.  If specified,
-  completion flags which simply report the type of operation that
-  completed (e.g. send or receive) may not be set.  However,
-  completion flags that are used for remote notifications will still
-  be set when applicable.  See [`fi_cq`(3)](fi_cq.3.html) for details on
-  which completion flags are valid when this mode bit is enabled.
-
-*FI_RESTRICTED_COMP*
-: This bit indicates that the application will only share completion queues
-  and counters among endpoints, transmit contexts, and receive contexts that
-  have the same set of capability flags.
 
 *FI_RX_CQ_DATA*
 : This mode bit only applies to data transfers that set FI_REMOTE_CQ_DATA.
@@ -734,6 +721,12 @@ via fi_freeinfo().
 : Indicates that requested version is newer than the library being used.
 
 # NOTES
+
+Various libfabric calls, including fi_getinfo, take a struct fi_info as
+input.  Applications must use libfabric allocated fi_info structures.
+A zeroed struct fi_info can be allocated using fi_allocinfo, which may
+then be initialized by the user.  A struct fi_info may be copied for
+modification using the fi_dupinfo() call.
 
 If hints are provided, the operation will be controlled by the values
 that are supplied in the various fields (see section on _fi_info_).

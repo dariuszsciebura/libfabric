@@ -395,7 +395,7 @@ int cxip_domain_prov_mr_id_alloc(struct cxip_domain *dom,
 	 */
 	key.events = mr->count_events || mr->rma_events || mr->cntr;
 
-	key.opt = cxip_env.optimized_mrs &&
+	key.opt = dom->optimized_mrs &&
 			key.id < CXIP_PTL_IDX_PROV_MR_OPT_CNT;
 	mr->key = key.raw;
 	ofi_spin_unlock(&dom->ctrl_id_lock);
@@ -608,6 +608,7 @@ static int cxip_dom_dwq_op_send(struct cxip_domain *dom, struct fi_op_msg *msg,
 				uint64_t trig_thresh)
 {
 	struct cxip_ep *ep = container_of(msg->ep, struct cxip_ep, ep);
+	struct cxip_txc *txc = ep->ep_obj->txc;
 	const void *buf;
 	size_t len;
 	int ret;
@@ -629,10 +630,10 @@ static int cxip_dom_dwq_op_send(struct cxip_domain *dom, struct fi_op_msg *msg,
 	buf = msg->msg.iov_count ? msg->msg.msg_iov[0].iov_base : NULL;
 	len = msg->msg.iov_count ? msg->msg.msg_iov[0].iov_len : 0;
 
-	ret = cxip_send_common(&ep->ep_obj->txc, ep->tx_attr.tclass, buf, len,
-			       NULL, msg->msg.data, msg->msg.addr, 0,
-			       msg->msg.context, msg->flags, false, true,
-			       trig_thresh, trig_cntr, comp_cntr);
+	ret = txc->ops.send_common(txc, ep->tx_attr.tclass, buf, len, NULL,
+				   msg->msg.data, msg->msg.addr, 0,
+				   msg->msg.context, msg->flags, false, true,
+				   trig_thresh, trig_cntr, comp_cntr);
 	if (ret)
 		CXIP_DBG("Failed to emit message triggered op, ret=%d\n", ret);
 	else
@@ -649,6 +650,7 @@ static int cxip_dom_dwq_op_tsend(struct cxip_domain *dom,
 				 uint64_t trig_thresh)
 {
 	struct cxip_ep *ep = container_of(tagged->ep, struct cxip_ep, ep);
+	struct cxip_txc *txc = ep->ep_obj->txc;
 	const void *buf;
 	size_t len;
 	int ret;
@@ -670,11 +672,11 @@ static int cxip_dom_dwq_op_tsend(struct cxip_domain *dom,
 	buf = tagged->msg.iov_count ? tagged->msg.msg_iov[0].iov_base : NULL;
 	len = tagged->msg.iov_count ? tagged->msg.msg_iov[0].iov_len : 0;
 
-	ret = cxip_send_common(&ep->ep_obj->txc, ep->tx_attr.tclass, buf, len,
-			       NULL, tagged->msg.data, tagged->msg.addr,
-			       tagged->msg.tag, tagged->msg.context,
-			       tagged->flags, true, true, trig_thresh,
-			       trig_cntr, comp_cntr);
+	ret = txc->ops.send_common(txc, ep->tx_attr.tclass, buf, len, NULL,
+				   tagged->msg.data, tagged->msg.addr,
+				   tagged->msg.tag, tagged->msg.context,
+				   tagged->flags, true, true, trig_thresh,
+				   trig_cntr, comp_cntr);
 	if (ret)
 		CXIP_DBG("Failed to emit tagged msg triggered op, ret=%d\n",
 			 ret);
@@ -707,7 +709,7 @@ static int cxip_dom_dwq_op_rma(struct cxip_domain *dom, struct fi_op_rma *rma,
 	buf = rma->msg.iov_count ? rma->msg.msg_iov[0].iov_base : NULL;
 	len = rma->msg.iov_count ? rma->msg.msg_iov[0].iov_len : 0;
 
-	ret = cxip_rma_common(op, &ep->ep_obj->txc, buf, len, NULL,
+	ret = cxip_rma_common(op, ep->ep_obj->txc, buf, len, NULL,
 			      rma->msg.addr, rma->msg.rma_iov[0].addr,
 			      rma->msg.rma_iov[0].key, rma->msg.data,
 			      rma->flags, ep->tx_attr.tclass,
@@ -729,7 +731,7 @@ static int cxip_dom_dwq_op_atomic(struct cxip_domain *dom,
 				  uint64_t trig_thresh)
 {
 	struct cxip_ep *ep = container_of(amo->ep, struct cxip_ep, ep);
-	struct cxip_txc *txc = &ep->ep_obj->txc;
+	struct cxip_txc *txc = ep->ep_obj->txc;
 	int ret;
 
 	if (!amo)
@@ -759,7 +761,7 @@ static int cxip_dom_dwq_op_fetch_atomic(struct cxip_domain *dom,
 					uint64_t trig_thresh)
 {
 	struct cxip_ep *ep = container_of(fetch_amo->ep, struct cxip_ep, ep);
-	struct cxip_txc *txc = &ep->ep_obj->txc;
+	struct cxip_txc *txc = ep->ep_obj->txc;
 	int ret;
 
 	if (!fetch_amo)
@@ -792,7 +794,7 @@ static int cxip_dom_dwq_op_comp_atomic(struct cxip_domain *dom,
 				       uint64_t trig_thresh)
 {
 	struct cxip_ep *ep = container_of(comp_amo->ep, struct cxip_ep, ep);
-	struct cxip_txc *txc = &ep->ep_obj->txc;
+	struct cxip_txc *txc = ep->ep_obj->txc;
 	int ret;
 
 	if (!comp_amo)
@@ -870,6 +872,7 @@ static int cxip_dom_dwq_op_recv(struct cxip_domain *dom, struct fi_op_msg *msg,
 				uint64_t trig_thresh)
 {
 	struct cxip_ep *ep = container_of(msg->ep, struct cxip_ep, ep);
+	struct cxip_rxc *rxc = ep->ep_obj->rxc;
 	void *buf;
 	size_t len;
 
@@ -880,9 +883,9 @@ static int cxip_dom_dwq_op_recv(struct cxip_domain *dom, struct fi_op_msg *msg,
 	buf = msg->msg.iov_count ? msg->msg.msg_iov[0].iov_base : NULL;
 	len = msg->msg.iov_count ? msg->msg.msg_iov[0].iov_len : 0;
 
-	return cxip_recv_common(&ep->ep_obj->rxc, buf, len, NULL, msg->msg.addr,
-				0, 0, msg->msg.context, msg->flags, false,
-				comp_cntr);
+	return rxc->ops.recv_common(rxc, buf, len, NULL, msg->msg.addr, 0, 0,
+				    msg->msg.context, msg->flags, false,
+				    comp_cntr);
 }
 
 static int cxip_dom_dwq_op_trecv(struct cxip_domain *dom,
@@ -892,6 +895,7 @@ static int cxip_dom_dwq_op_trecv(struct cxip_domain *dom,
 				 uint64_t trig_thresh)
 {
 	struct cxip_ep *ep = container_of(tagged->ep, struct cxip_ep, ep);
+	struct cxip_rxc *rxc = ep->ep_obj->rxc;
 	void *buf;
 	size_t len;
 
@@ -902,10 +906,10 @@ static int cxip_dom_dwq_op_trecv(struct cxip_domain *dom,
 	buf = tagged->msg.iov_count ? tagged->msg.msg_iov[0].iov_base : NULL;
 	len = tagged->msg.iov_count ? tagged->msg.msg_iov[0].iov_len : 0;
 
-	return cxip_recv_common(&ep->ep_obj->rxc, buf, len, tagged->msg.desc,
-				tagged->msg.addr, tagged->msg.tag,
-				tagged->msg.ignore, tagged->msg.context,
-				tagged->flags, true, comp_cntr);
+	return rxc->ops.recv_common(rxc, buf, len, tagged->msg.desc,
+				    tagged->msg.addr, tagged->msg.tag,
+				    tagged->msg.ignore, tagged->msg.context,
+				    tagged->flags, true, comp_cntr);
 }
 
 /* Must hold domain lock. */
@@ -1552,6 +1556,85 @@ static int cxip_query_atomic(struct fid_domain *domain,
 	return FI_SUCCESS;
 }
 
+struct fi_ops_srx_peer cxip_srx_peer_ops = {
+	.size = sizeof(struct fi_ops_srx_peer),
+	.start_msg = cxip_unexp_start,
+	.start_tag = cxip_unexp_start,
+	.discard_msg = cxip_no_discard,
+	.discard_tag = cxip_no_discard,
+};
+
+static int cxip_srx_close(struct fid *fid)
+{
+	struct cxip_domain *dom;
+
+	dom = container_of(fid, struct cxip_domain, rx_ep.fid);
+
+	ofi_atomic_dec32(&dom->util_domain.ref);
+
+	return FI_SUCCESS;
+}
+
+static struct fi_ops cxip_srx_fi_ops = {
+	.size = sizeof(struct fi_ops),
+	.close = cxip_srx_close,
+	.bind = fi_no_bind,
+	.control = fi_no_control,
+	.ops_open = fi_no_ops_open,
+};
+
+static struct fi_ops_msg cxip_srx_msg_ops = {
+	.size = sizeof(struct fi_ops_msg),
+	.recv = fi_no_msg_recv,
+	.recvv = fi_no_msg_recvv,
+	.recvmsg = fi_no_msg_recvmsg,
+	.send = fi_no_msg_send,
+	.sendv = fi_no_msg_sendv,
+	.sendmsg = fi_no_msg_sendmsg,
+	.inject = fi_no_msg_inject,
+	.senddata = fi_no_msg_senddata,
+	.injectdata = fi_no_msg_injectdata,
+};
+
+static struct fi_ops_tagged cxip_srx_tagged_ops = {
+	.size = sizeof(struct fi_ops_msg),
+	.recv = fi_no_tagged_recv,
+	.recvv = fi_no_tagged_recvv,
+	.recvmsg = fi_no_tagged_recvmsg,
+	.send = fi_no_tagged_send,
+	.sendv = fi_no_tagged_sendv,
+	.sendmsg = fi_no_tagged_sendmsg,
+	.inject = fi_no_tagged_inject,
+	.senddata = fi_no_tagged_senddata,
+	.injectdata = fi_no_tagged_injectdata,
+};
+
+static int cxip_srx_context(struct fid_domain *fid, struct fi_rx_attr *attr,
+		struct fid_ep **rx_ep, void *context)
+{
+	struct cxip_domain *dom;
+
+	if (!context || ! attr || !fid)
+		return -FI_EINVAL;
+
+	dom = container_of(fid, struct cxip_domain,
+			   util_domain.domain_fid.fid);
+
+	if (attr->op_flags & FI_PEER) {
+		dom->owner_srx = ((struct fi_peer_srx_context *) context)->srx;
+		dom->owner_srx->peer_ops = &cxip_srx_peer_ops;
+		dom->rx_ep.msg = &cxip_srx_msg_ops;
+		dom->rx_ep.tagged = &cxip_srx_tagged_ops;
+		dom->rx_ep.fid.ops = &cxip_srx_fi_ops;
+		dom->rx_ep.fid.fclass = FI_CLASS_SRX_CTX;
+		*rx_ep = &dom->rx_ep;
+		ofi_atomic_inc32(&dom->util_domain.ref);
+		return FI_SUCCESS;
+	}
+
+	return -FI_ENOSYS;
+}
+
 static int cxip_query_collective(struct fid_domain *domain,
 				 enum fi_collective_op coll,
 			         struct fi_collective_attr *attr,
@@ -1691,7 +1774,7 @@ static struct fi_ops_domain cxip_dom_ops = {
 	.cntr_open = cxip_cntr_open,
 	.poll_open = fi_no_poll_open,
 	.stx_ctx = fi_no_stx_context,
-	.srx_ctx = fi_no_srx_context,
+	.srx_ctx = cxip_srx_context,
 	.query_atomic = cxip_query_atomic,
 	.query_collective = cxip_query_collective
 };

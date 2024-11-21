@@ -43,7 +43,7 @@ struct fi_info *efa_unit_test_alloc_hints(enum fi_ep_type ep_type)
 	if (!hints)
 		return NULL;
 
-	hints->fabric_attr->prov_name = "efa";
+	hints->fabric_attr->prov_name = strdup("efa");
 	hints->ep_attr->type = ep_type;
 
 	hints->domain_attr->mr_mode |= FI_MR_LOCAL | FI_MR_ALLOCATED;
@@ -56,15 +56,15 @@ struct fi_info *efa_unit_test_alloc_hints(enum fi_ep_type ep_type)
 
 void efa_unit_test_resource_construct_with_hints(struct efa_resource *resource,
 						 enum fi_ep_type ep_type,
-						 struct fi_info *hints,
-						 bool enable_ep)
+						 uint32_t fi_version, struct fi_info *hints,
+						 bool enable_ep, bool open_cq)
 {
 	int ret = 0;
 	struct fi_av_attr av_attr = {0};
 	struct fi_cq_attr cq_attr = {0};
 	struct fi_eq_attr eq_attr = {0};
 
-	ret = fi_getinfo(FI_VERSION(1, 14), NULL, NULL, 0ULL, hints, &resource->info);
+	ret = fi_getinfo(fi_version, NULL, NULL, 0ULL, hints, &resource->info);
 	if (ret)
 		goto err;
 
@@ -92,11 +92,13 @@ void efa_unit_test_resource_construct_with_hints(struct efa_resource *resource,
 
 	fi_ep_bind(resource->ep, &resource->av->fid, 0);
 
-	ret = fi_cq_open(resource->domain, &cq_attr, &resource->cq, NULL);
-	if (ret)
-		goto err;
+	if (open_cq) {
+		ret = fi_cq_open(resource->domain, &cq_attr, &resource->cq, NULL);
+		if (ret)
+			goto err;
 
-	fi_ep_bind(resource->ep, &resource->cq->fid, FI_SEND | FI_RECV);
+		fi_ep_bind(resource->ep, &resource->cq->fid, FI_SEND | FI_RECV);
+	}
 
 	if (enable_ep) {
 		ret = fi_enable(resource->ep);
@@ -118,8 +120,8 @@ void efa_unit_test_resource_construct(struct efa_resource *resource, enum fi_ep_
 	resource->hints = efa_unit_test_alloc_hints(ep_type);
 	if (!resource->hints)
 		goto err;
-	efa_unit_test_resource_construct_with_hints(resource, ep_type,
-						    resource->hints, true);
+	efa_unit_test_resource_construct_with_hints(resource, ep_type, FI_VERSION(1, 14),
+	                                            resource->hints, true, true);
 	return;
 
 err:
@@ -135,15 +137,65 @@ void efa_unit_test_resource_construct_ep_not_enabled(struct efa_resource *resour
 	resource->hints = efa_unit_test_alloc_hints(ep_type);
 	if (!resource->hints)
 		goto err;
-	efa_unit_test_resource_construct_with_hints(resource, ep_type,
-						    resource->hints, false);
+	efa_unit_test_resource_construct_with_hints(resource, ep_type, FI_VERSION(1, 14),
+						    resource->hints, false, true);
 	return;
 
 err:
 	efa_unit_test_resource_destruct(resource);
 
 	/* Fail test early if the resource struct fails to initialize */
-	assert_int_equal(1, 0);
+	fail();
+}
+
+void efa_unit_test_resource_construct_no_cq_and_ep_not_enabled(struct efa_resource *resource,
+				      enum fi_ep_type ep_type)
+{
+	resource->hints = efa_unit_test_alloc_hints(ep_type);
+	if (!resource->hints)
+		goto err;
+	efa_unit_test_resource_construct_with_hints(resource, ep_type, FI_VERSION(1, 14),
+						    resource->hints, false, false);
+	return;
+
+err:
+	efa_unit_test_resource_destruct(resource);
+
+	/* Fail test early if the resource struct fails to initialize */
+	fail();
+}
+
+/**
+ * @brief Construct RDM ep type resources with shm disabled
+ */
+void efa_unit_test_resource_construct_rdm_shm_disabled(struct efa_resource *resource)
+{
+	int ret;
+	bool shm_permitted = false;
+
+	resource->hints = efa_unit_test_alloc_hints(FI_EP_RDM);
+	if (!resource->hints)
+		goto err;
+
+	efa_unit_test_resource_construct_with_hints(resource, FI_EP_RDM, FI_VERSION(1, 14),
+						    resource->hints, false, true);
+
+	ret = fi_setopt(&resource->ep->fid, FI_OPT_ENDPOINT,
+			FI_OPT_SHARED_MEMORY_PERMITTED, &shm_permitted,
+			sizeof(shm_permitted));
+	if (ret)
+		goto err;
+
+	ret = fi_enable(resource->ep);
+	if (ret)
+		goto err;
+
+	return;
+err:
+	efa_unit_test_resource_destruct(resource);
+
+	/* Fail test early if the resource struct fails to initialize */
+	fail();
 }
 
 /**
@@ -179,6 +231,10 @@ void efa_unit_test_resource_destruct(struct efa_resource *resource)
 
 	if (resource->info) {
 		fi_freeinfo(resource->info);
+	}
+
+	if (resource->hints) {
+		fi_freeinfo(resource->hints);
 	}
 }
 

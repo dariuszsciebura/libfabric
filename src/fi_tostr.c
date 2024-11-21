@@ -126,10 +126,7 @@ static void ofi_tostr_addr_format(char *buf, size_t len, uint32_t addr_format)
 	CASEENUMSTRN(FI_ADDR_OPX, len);
 	CASEENUMSTRN(FI_ADDR_CXI, len);
 	default:
-		if (addr_format & FI_PROV_SPECIFIC)
-			ofi_strncatf(buf, len, "Provider specific");
-		else
-			ofi_strncatf(buf, len, "Unknown");
+		ofi_strncatf(buf, len, "Unknown");
 		break;
 	}
 }
@@ -140,6 +137,7 @@ static void ofi_tostr_progress(char *buf, size_t len, enum fi_progress progress)
 	CASEENUMSTRN(FI_PROGRESS_UNSPEC, len);
 	CASEENUMSTRN(FI_PROGRESS_AUTO, len);
 	CASEENUMSTRN(FI_PROGRESS_MANUAL, len);
+	CASEENUMSTRN(FI_PROGRESS_CONTROL_UNIFIED, len);
 	default:
 		ofi_strncatf(buf, len, "Unknown");
 		break;
@@ -152,10 +150,8 @@ ofi_tostr_threading(char *buf, size_t len, enum fi_threading threading)
 	switch (threading) {
 	CASEENUMSTRN(FI_THREAD_UNSPEC, len);
 	CASEENUMSTRN(FI_THREAD_SAFE, len);
-	CASEENUMSTRN(FI_THREAD_FID, len);
 	CASEENUMSTRN(FI_THREAD_DOMAIN, len);
 	CASEENUMSTRN(FI_THREAD_COMPLETION, len);
-	CASEENUMSTRN(FI_THREAD_ENDPOINT, len);
 	default:
 		ofi_strncatf(buf, len, "Unknown");
 		break;
@@ -185,19 +181,6 @@ static void ofi_tostr_msgorder(char *buf, size_t len, uint64_t flags)
 	ofi_remove_comma(buf);
 }
 
-static void ofi_tostr_comporder(char *buf, size_t len, uint64_t flags)
-{
-	if ((flags & FI_ORDER_STRICT) == FI_ORDER_NONE) {
-		ofi_strncatf(buf, len, "FI_ORDER_NONE, ");
-	} else if ((flags & FI_ORDER_STRICT) == FI_ORDER_STRICT) {
-		ofi_strncatf(buf, len, "FI_ORDER_STRICT, ");
-	}
-
-	IFFLAGSTRN(flags, FI_ORDER_DATA, len);
-
-	ofi_remove_comma(buf);
-}
-
 static void ofi_tostr_caps(char *buf, size_t len, uint64_t caps)
 {
 	IFFLAGSTRN(caps, FI_MSG, len);
@@ -219,7 +202,6 @@ static void ofi_tostr_caps(char *buf, size_t len, uint64_t caps)
 	IFFLAGSTRN(caps, FI_TRIGGER, len);
 	IFFLAGSTRN(caps, FI_FENCE, len);
 
-	IFFLAGSTRN(caps, FI_VARIABLE_MSG, len);
 	IFFLAGSTRN(caps, FI_RMA_PMEM, len);
 	IFFLAGSTRN(caps, FI_SOURCE_ERR, len);
 	IFFLAGSTRN(caps, FI_LOCAL_COMM, len);
@@ -229,6 +211,8 @@ static void ofi_tostr_caps(char *buf, size_t len, uint64_t caps)
 	IFFLAGSTRN(caps, FI_SOURCE, len);
 	IFFLAGSTRN(caps, FI_NAMED_RX_CTX, len);
 	IFFLAGSTRN(caps, FI_DIRECTED_RECV, len);
+	IFFLAGSTRN(caps, FI_AV_USER_ID, len);
+	IFFLAGSTRN(caps, FI_PEER, len);
 	IFFLAGSTRN(caps, FI_HMEM, len);
 
 	ofi_remove_comma(buf);
@@ -241,8 +225,6 @@ static void ofi_tostr_ep_type(char *buf, size_t len, enum fi_ep_type ep_type)
 	CASEENUMSTRN(FI_EP_MSG, len);
 	CASEENUMSTRN(FI_EP_DGRAM, len);
 	CASEENUMSTRN(FI_EP_RDM, len);
-	CASEENUMSTRN(FI_EP_SOCK_STREAM, len);
-	CASEENUMSTRN(FI_EP_SOCK_DGRAM, len);
 	default:
 		ofi_strncatf(buf, len, "Unknown");
 		break;
@@ -275,11 +257,11 @@ static void ofi_tostr_protocol(char *buf, size_t len, uint32_t protocol)
 	CASEENUMSTRN(FI_PROTO_CXI, len);
 	CASEENUMSTRN(FI_PROTO_XNET, len);
 	CASEENUMSTRN(FI_PROTO_SM2, len);
+	CASEENUMSTRN(FI_PROTO_CXI_RNR, len);
+	CASEENUMSTRN(FI_PROTO_LPP, len);
+	CASEENUMSTRN(FI_PROTO_LNX, len);
 	default:
-		if (protocol & FI_PROV_SPECIFIC)
-			ofi_strncatf(buf, len, "Provider specific");
-		else
-			ofi_strncatf(buf, len, "Unknown");
+		ofi_strncatf(buf, len, "Unknown");
 		break;
 	}
 }
@@ -290,11 +272,8 @@ static void ofi_tostr_mode(char *buf, size_t len, uint64_t mode)
 	IFFLAGSTRN(mode, FI_MSG_PREFIX, len);
 	IFFLAGSTRN(mode, FI_ASYNC_IOV, len);
 	IFFLAGSTRN(mode, FI_RX_CQ_DATA, len);
-	IFFLAGSTRN(mode, FI_LOCAL_MR, len);
-	IFFLAGSTRN(mode, FI_NOTIFY_FLAGS_ONLY, len);
-	IFFLAGSTRN(mode, FI_RESTRICTED_COMP, len);
+	IFFLAGSTRN2(mode, OFI_LOCAL_MR, FI_LOCAL_MR, len);
 	IFFLAGSTRN(mode, FI_CONTEXT2, len);
-	IFFLAGSTRN(mode, FI_BUFFERED_RECV, len);
 
 	ofi_remove_comma(buf);
 }
@@ -342,10 +321,6 @@ ofi_tostr_tx_attr(char *buf, size_t len, const struct fi_tx_attr *attr,
 	ofi_tostr_msgorder(buf, len, attr->msg_order);
 	ofi_strncatf(buf, len, " ]\n");
 
-	ofi_strncatf(buf, len, "%s%scomp_order: [ ", prefix, TAB);
-	ofi_tostr_comporder(buf, len, attr->comp_order);
-	ofi_strncatf(buf, len, " ]\n");
-
 	ofi_strncatf(buf, len, "%s%sinject_size: %zu\n", prefix, TAB,
 		     attr->inject_size);
 	ofi_strncatf(buf, len, "%s%ssize: %zu\n", prefix, TAB, attr->size);
@@ -382,12 +357,6 @@ ofi_tostr_rx_attr(char *buf, size_t len, const struct fi_rx_attr *attr,
 	ofi_tostr_msgorder(buf, len, attr->msg_order);
 	ofi_strncatf(buf, len, " ]\n");
 
-	ofi_strncatf(buf, len, "%s%scomp_order: [ ", prefix, TAB);
-	ofi_tostr_comporder(buf, len, attr->comp_order);
-	ofi_strncatf(buf, len, " ]\n");
-
-	ofi_strncatf(buf, len, "%s%stotal_buffered_recv: %zu\n", prefix, TAB,
-		     attr->total_buffered_recv);
 	ofi_strncatf(buf, len, "%s%ssize: %zu\n", prefix, TAB, attr->size);
 	ofi_strncatf(buf, len, "%s%siov_limit: %zu\n", prefix, TAB,
 		     attr->iov_limit);
@@ -466,8 +435,8 @@ static void ofi_tostr_av_type(char *buf, size_t len, enum fi_av_type type)
 
 static void ofi_tostr_mr_mode(char *buf, size_t len, int mr_mode)
 {
-	IFFLAGSTRN(mr_mode, FI_MR_BASIC, len);
-	IFFLAGSTRN(mr_mode, FI_MR_SCALABLE, len);
+	IFFLAGSTRN2(mr_mode, OFI_MR_BASIC, FI_MR_BASIC, len);
+	IFFLAGSTRN2(mr_mode, OFI_MR_SCALABLE, FI_MR_SCALABLE, len);
 	IFFLAGSTRN(mr_mode, FI_MR_LOCAL, len);
 	IFFLAGSTRN(mr_mode, FI_MR_RAW, len);
 	IFFLAGSTRN(mr_mode, FI_MR_VIRT_ADDR, len);
@@ -520,11 +489,8 @@ ofi_tostr_domain_attr(char *buf, size_t len, const struct fi_domain_attr *attr,
 	ofi_tostr_threading(buf, len, attr->threading);
 	ofi_strncatf(buf, len, "\n");
 
-	ofi_strncatf(buf, len, "%s%scontrol_progress: ", prefix,TAB);
-	ofi_tostr_progress(buf, len, attr->control_progress);
-	ofi_strncatf(buf, len, "\n");
-	ofi_strncatf(buf, len, "%s%sdata_progress: ", prefix, TAB);
-	ofi_tostr_progress(buf, len, attr->data_progress);
+	ofi_strncatf(buf, len, "%s%sprogress: ", prefix, TAB);
+	ofi_tostr_progress(buf, len, attr->progress);
 	ofi_strncatf(buf, len, "\n");
 	ofi_strncatf(buf, len, "%s%sresource_mgmt: ", prefix, TAB);
 	ofi_tostr_resource_mgmt(buf, len, attr->resource_mgmt);
@@ -905,6 +871,7 @@ ofi_tostr_cntr_events(char *buf, size_t len, enum fi_cntr_events events)
 {
 	switch (events) {
 	CASEENUMSTRN(FI_CNTR_EVENTS_COMP, len);
+	CASEENUMSTRN(FI_CNTR_EVENTS_BYTES, len);
 	default:
 		ofi_strncatf(buf, len, "Unknown");
 		break;

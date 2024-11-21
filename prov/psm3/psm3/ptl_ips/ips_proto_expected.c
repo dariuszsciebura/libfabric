@@ -53,17 +53,16 @@
 
 /* Copyright (c) 2016 Intel Corporation. All rights reserved. */
 
-// This file implements the TID protocol for STL100 and the RDMA
-// protocol for UD mode.  The majority of functons in this file (perhaps all)
-// are not used when TID/RDMA is disabled via PSM3_TID o PSM3_RDMA respectively
-// RDMA is N/A for UDP, so it will behave as if PSM3_RDMA is disabled
+// This file implements the RDMA
+// protocol for verbs mode.  The majority of functons in this file (perhaps all)
+// are not used when RDMA is disabled via PSM3_RDMA
+// RDMA is N/A for sockets, so it will behave as if PSM3_RDMA is disabled
 // and not use functions in this file.
 
 #include "psm_user.h"
 #include "psm2_hal.h"
 
 #include "ips_scb.h"
-#include "ips_tid.h"
 #include "ips_tidflow.h"
 #include "ips_proto.h"
 #include "ips_expected_proto.h"
@@ -113,7 +112,6 @@ static void psmi_attach_chb_to_tidsendc(struct ips_protoexp *protoexp,
 					struct ips_gpu_hostbuf *chb_prev,
 					uint32_t tsess_srcoff,
 					uint32_t tsess_length,
-					uint32_t tsess_unaligned_start,
 					psm2_chb_match_type_t type);
 #endif
 
@@ -175,12 +173,10 @@ MOCKABLE(psm3_ips_protoexp_init)(const struct ips_proto *proto,
 	if (err != PSM2_OK)
 		goto fail;
 
-
 	if ((err = psm3_ips_scbctrl_init(ep, num_of_send_desc, 0,
 				    0, 0, ips_tid_scbavail_callback,
 				    protoexp, &protoexp->tid_scbc_rv)))
 		goto fail;
-
 
 	{
 		union psmi_envvar_val env_rts_cts_interleave;
@@ -256,62 +252,71 @@ MOCKABLE(psm3_ips_protoexp_init)(const struct ips_proto *proto,
 #endif
 #endif
 
-
-
 #if defined(PSM_CUDA) || defined(PSM_ONEAPI)
-	{
-		if (PSMI_IS_GPU_ENABLED &&
-			 !(proto->flags & IPS_PROTO_FLAG_GPUDIRECT_RDMA_RECV)) {
-			struct psmi_rlimit_mpool rlim = GPU_HOSTBUFFER_LIMITS;
-			uint32_t maxsz, chunksz, max_elements;
+	if (PSMI_IS_GPU_ENABLED) {
+		struct psmi_rlimit_mpool rlim = GPU_HOSTBUFFER_LIMITS;
+		uint32_t maxsz, chunksz, max_elements;
+		uint32_t pool_num_obj_max_total;
+		uint32_t small_pool_num_obj_max_total;
 
-			if ((err = psm3_parse_mpool_env(protoexp->proto->mq, 1,
-							&rlim, &maxsz, &chunksz)))
-				goto fail;
+		if ((err = psm3_parse_mpool_env(protoexp->proto->mq, 1,
+						&rlim, &maxsz, &chunksz)))
+			goto fail;
 
-			/* the maxsz is the amount in MB, not the number of entries,
-			 * since the element size depends on the window size */
-			max_elements = (maxsz*1024*1024) / proto->mq->hfi_base_window_rv;
-			/* mpool requires max_elements to be power of 2. round down. */
-			max_elements = 1 << (31 - __builtin_clz(max_elements));
-			protoexp->gpu_hostbuf_recv_cfg.bufsz =
-				proto->mq->hfi_base_window_rv;
+		/* the maxsz is the amount in MB, not the number of entries,
+		 * since the element size depends on the window size */
+		max_elements = (maxsz*1024*1024) /
+			psm3_mq_max_window_rv(proto->mq, 1);
+		/* mpool requires max_elements to be power of 2. round down. */
+		max_elements = 1 << (31 - __builtin_clz(max_elements));
+		/* need at least 2 buffers */
+		max_elements = max(2, max_elements);
+		protoexp->gpu_hostbuf_recv_cfg.bufsz =
+			psm3_mq_max_window_rv(proto->mq, 1);
 
-			protoexp->gpu_hostbuf_pool_recv =
-				psm3_mpool_create_for_gpu(sizeof(struct ips_gpu_hostbuf),
-							  chunksz, max_elements, 0,
-							  UNDEFINED, NULL, NULL,
-							  psmi_gpu_hostbuf_alloc_func,
-							  (void *)
-							  &protoexp->gpu_hostbuf_recv_cfg);
+		protoexp->gpu_hostbuf_pool_recv =
+			psm3_mpool_create_for_gpu(sizeof(struct ips_gpu_hostbuf),
+						  chunksz, max_elements, 0,
+						  UNDEFINED, NULL, NULL,
+						  psmi_gpu_hostbuf_alloc_func,
+						  (void *)
+						  &protoexp->gpu_hostbuf_recv_cfg);
 
-			if (protoexp->gpu_hostbuf_pool_recv == NULL) {
-				err = psm3_handle_error(proto->ep, PSM2_NO_MEMORY,
-							"Couldn't allocate GPU host receive buffer pool");
-				goto fail;
-			}
-
-			protoexp->gpu_hostbuf_small_recv_cfg.bufsz =
-				GPU_SMALLHOSTBUF_SZ;
-			protoexp->gpu_hostbuf_pool_small_recv =
-				psm3_mpool_create_for_gpu(sizeof(struct ips_gpu_hostbuf),
-							  chunksz, max_elements, 0,
-							  UNDEFINED, NULL, NULL,
-							  psmi_gpu_hostbuf_alloc_func,
-							  (void *)
-							  &protoexp->gpu_hostbuf_small_recv_cfg);
-
-			if (protoexp->gpu_hostbuf_pool_small_recv == NULL) {
-				err = psm3_handle_error(proto->ep, PSM2_NO_MEMORY,
-							"Couldn't allocate GPU host small receive buffer pool");
-				goto fail;
-			}
-			PSM3_GPU_PREPARE_HTOD_MEMCPYS(protoexp);
-			STAILQ_INIT(&protoexp->gpupend_getreqsq);
-		} else {
-			protoexp->gpu_hostbuf_pool_recv = NULL;
-			protoexp->gpu_hostbuf_pool_small_recv = NULL;
+		if (protoexp->gpu_hostbuf_pool_recv == NULL) {
+			err = psm3_handle_error(proto->ep, PSM2_NO_MEMORY,
+						"Couldn't allocate GPU host receive buffer pool");
+			goto fail;
 		}
+		psm3_mpool_get_obj_info(protoexp->gpu_hostbuf_pool_recv,
+					NULL, &pool_num_obj_max_total);
+
+		protoexp->gpu_hostbuf_small_recv_cfg.bufsz =
+			GPU_SMALLHOSTBUF_SZ;
+		protoexp->gpu_hostbuf_pool_small_recv =
+			psm3_mpool_create_for_gpu(sizeof(struct ips_gpu_hostbuf),
+						  chunksz, max_elements, 0,
+						  UNDEFINED, NULL, NULL,
+						  psmi_gpu_hostbuf_alloc_func,
+						  (void *)
+						  &protoexp->gpu_hostbuf_small_recv_cfg);
+
+		if (protoexp->gpu_hostbuf_pool_small_recv == NULL) {
+			err = psm3_handle_error(proto->ep, PSM2_NO_MEMORY,
+						"Couldn't allocate GPU host small receive buffer pool");
+			goto fail;
+		}
+		psm3_mpool_get_obj_info(protoexp->gpu_hostbuf_pool_small_recv,
+					NULL, &small_pool_num_obj_max_total);
+		_HFI_DBG("GPU Recv Copy Pipeline: %u of %u bytes (small), %u of %u bytes\n",
+			small_pool_num_obj_max_total,
+			protoexp->gpu_hostbuf_small_recv_cfg.bufsz,
+			pool_num_obj_max_total,
+			protoexp->gpu_hostbuf_recv_cfg.bufsz);
+		PSM3_GPU_PREPARE_HTOD_MEMCPYS(protoexp);
+		STAILQ_INIT(&protoexp->gpupend_getreqsq);
+	} else {
+		protoexp->gpu_hostbuf_pool_recv = NULL;
+		protoexp->gpu_hostbuf_pool_small_recv = NULL;
 	}
 #endif
 	psmi_assert(err == PSM2_OK);
@@ -355,14 +360,11 @@ psm2_error_t psm3_ips_protoexp_fini(struct ips_protoexp *protoexp)
 	if ((err = psm3_ips_scbctrl_fini(&protoexp->tid_scbc_rv)))
 		goto fail;
 
-
 	/* finalize tid flow control. */
 	if ((err = psm3_ips_tf_fini(&protoexp->tfc)))
 		goto fail;
 
-
 	psmi_free(protoexp);
-
 fail:
 	return err;
 }
@@ -401,19 +403,16 @@ void ips_tid_mravail_callback(struct ips_proto *proto)
 
 #endif // PSM_HAVE_RDMA
 
-// On STL100 ips_tf is a user space control for the HW tidflow which
+// On STL100 ips_tf was a user space control for the HW tidflow which
 // would fully process most valid inbound EXPTID packets within an RV Window.
-// For UD we maintain the user space control to help manage each active
+// For verbs we maintain the user space control to help manage each active
 // RV window.
 // There is one CTS per RV window (typically 128K).
-// For UD with RV, RDMA is used instread of EXPTID, with 1 RDMA per RV window.
+// For verbs with RV, RDMA is used instread of EXPTID, with 1 RDMA per RV window
 // Typically there are 32 (HFI_TF_NFLOWS) configured.
 // The 32 is hard coded, could make it tunable.
 // The tidflow provides a natural pacing mechanism and limits the total amount
-// of inflight EXPTID or RDMA incoming to given receiver.
-// In addition on STL100 there is an upper bound on TIDs which limited total
-// inbound DMA for a receiver to avoid 4MB. For smaller messages tidflow
-// count may be the limit, for larger messages TIDs would be the limit.
+// of inflight RDMA incoming to given receiver.
 
 /* New Tid Flows are available. If there are pending get requests put the
  * get timer on the timerq so it can be processed. */
@@ -460,7 +459,7 @@ psm3_ips_protoexp_tid_get_from_token(struct ips_protoexp *protoexp,
 	uint64_t nbytes;
 
 	PSM2_LOG_MSG("entering");
-	psmi_assert((req->mq->hfi_base_window_rv % PSMI_PAGESIZE) == 0);
+	psmi_assert((psm3_mq_get_window_rv(req) % PSMI_PAGESIZE) == 0);
 	getreq = (struct ips_tid_get_request *)
 	    psm3_mpool_get(protoexp->tid_getreq_pool);
 
@@ -519,8 +518,9 @@ psm3_ips_protoexp_tid_get_from_token(struct ips_protoexp *protoexp,
 	else
 #endif
 		nbytes = PSMI_ALIGNUP((length + count - 1) / count, PSMI_PAGESIZE);
-	getreq->tidgr_rndv_winsz =
-	    min(nbytes, req->mq->hfi_base_window_rv);
+	getreq->tidgr_rndv_winsz = psm3_mq_get_window_rv(req);
+	if (nbytes < getreq->tidgr_rndv_winsz)
+		getreq->tidgr_rndv_winsz = nbytes;
 	_HFI_MMDBG("posting TID get request: nbytes=%"PRIu64" winsz=%u len=%u\n",
 				 nbytes, getreq->tidgr_rndv_winsz, getreq->tidgr_length);
 	// we have now computed the size of each TID sequence (tidgr_rndv_winsz)
@@ -530,12 +530,10 @@ psm3_ips_protoexp_tid_get_from_token(struct ips_protoexp *protoexp,
 	tidflows = ips_tf_available(&protoexp->tfc);
 	_HFI_MMDBG("available tidflow %u\n", tidflows);
 
-	if (
-		tidflows > 0)
+	if (tidflows > 0)
 		// get the actual TIDs and tidflows and send the CTS
 		ips_tid_pendtids_timer_callback(&protoexp->timer_getreqs, 0);
-	else if (
-		tidflows != -1)
+	else if (tidflows != -1)
 		// out of TIDs, set a timer to try again later
 		psmi_timer_request(protoexp->timerq, &protoexp->timer_getreqs,
 				   PSMI_TIMER_PRIO_1);
@@ -635,12 +633,19 @@ psm3_ips_protoexp_send_tid_grant(struct ips_tid_recv_desc *tidrecvc)
 
 
 #if defined(PSM_CUDA) || defined(PSM_ONEAPI)
-static
-void psmi_deallocate_chb(struct ips_gpu_hostbuf* chb)
+void psm3_ips_deallocate_send_chb(struct ips_gpu_hostbuf* chb, int reset)
 {
-	PSM3_GPU_HOSTBUF_DESTROY(chb);
-	psmi_free(chb);
-	return;
+	if (chb->is_tempbuf) {
+		PSM3_GPU_HOSTBUF_DESTROY(chb);
+		psmi_free(chb);
+	} else {
+		chb->req = NULL;
+		chb->offset = 0;
+		chb->bytes_read = 0;
+		if (reset)
+			PSM3_GPU_HOSTBUF_RESET(chb);
+		psm3_mpool_put(chb);
+	}
 }
 #endif
 
@@ -677,19 +682,13 @@ ips_protoexp_tidsendc_complete(struct ips_tid_send_desc *tidsendc)
 				STAILQ_REMOVE(&req->sendreq_prefetch,
 					      tidsendc->gpu_hostbuf[0],
 					      ips_gpu_hostbuf, req_next);
-				if (tidsendc->gpu_hostbuf[0]->is_tempbuf)
-					psmi_deallocate_chb(tidsendc->gpu_hostbuf[0]);
-				else {
-					tidsendc->gpu_hostbuf[0]->req = NULL;
-					tidsendc->gpu_hostbuf[0]->offset = 0;
-					tidsendc->gpu_hostbuf[0]->bytes_read = 0;
-					PSM3_GPU_HOSTBUF_RESET(tidsendc->gpu_hostbuf[0]);
-					psm3_mpool_put(tidsendc->gpu_hostbuf[0]);
-				}
+				psm3_ips_deallocate_send_chb(tidsendc->gpu_hostbuf[0], 1);
 				psmi_gpu_run_prefetcher(protoexp, tidsendc);
 			}
-		} else
-			psmi_free(tidsendc->userbuf);
+		} else {
+			psm3_ips_deallocate_send_chb(tidsendc->gpu_split_buf, 0);
+			tidsendc->gpu_split_buf = NULL;
+		}
 	}
 #endif
 	/* Check if we can complete the send request. */
@@ -717,7 +716,6 @@ ips_protoexp_tidsendc_complete(struct ips_tid_send_desc *tidsendc)
 // so it cannot issue any sends directly, otherwise we will have a recursive
 // situation and potentially deeper recursion if more send CQEs found
 // key notes in this regard:
-//	OPA100 code which may send acks here is ifdef'ed out since N/A to RC QP RDMA
 //	psm3_mq_handle_rts_complete - sets flags in req and queues it, no callbacks
 //	psm3_mpool_put(tidsendc) - tid_desc_send_pool has no callback configured
 //	ips_tid_mravail_callback - psmi_timer_request call queues timer for future
@@ -1156,13 +1154,10 @@ done:
 #endif // defined(PSM_VERBS)
 
 #ifdef PSM_HAVE_RDMA
-// Intermediate STL100 EXTID packets can be delivered to software when
-// acks are requested.
-// The final packet in a STL100 EXTID flow is also delivered to software
-// to indicate the completion of the flow and can contain unaligned data.
-// for RDMA Write we will simply use immediate data in the write
-// to indicate the completed receive of the RDMA Write
-// if we use RDMA Read, the local SQ Completion will indicate this
+// Upon completion of an RDMA Write, a completion is delivered with
+// immediate data.  The immediate data is used
+// to indicate the completed receive of the RDMA Write.
+// If we use RDMA Read, the local SQ Completion will indicate this.
 #if defined(PSM_VERBS)
 // could build and pass a ips_recvhdrq_event or pass struct ips_recvhdrq
 // but all we really need is proto and len
@@ -1220,7 +1215,9 @@ int ips_protoexp_handle_immed_data(struct ips_proto *proto, uint64_t conn_ref,
 	// For User RC conn_ref is context we set in rc_qp_create (*ipsaddr)
 	// For Kernel RC, conn_ref is the conn handle (psm3_rv_conn_get_conn_handle)
 	// maybe this should be an assert so don't add test in production code
+	// caller can't get qp_context (conn_ref) from rbuf_qp for SRQ
 	if ((conn_type == RDMA_IMMED_USER_RC)
+			&& ! proto->ep->verbs_ep.srq
 			&& (uint64_t)tidrecvc->ipsaddr != conn_ref) {
 		// RDWA Write is not on expected RC QP from remote node
 		_HFI_ERROR("RDMA Write on Wrong User QP 0x%"PRIx64", expect 0x%"PRIx64"\n",
@@ -1253,7 +1250,7 @@ int ips_protoexp_handle_immed_data(struct ips_proto *proto, uint64_t conn_ref,
 
 	/* Do some sanity checking */
 	psmi_assert_always(tidrecvc->state == TIDRECVC_STATE_BUSY);
-	// STL100 does this at the end of ips_protoexp_send_tid_completion
+	// STL100 did this at the end of ips_protoexp_send_tid_completion
 	// TBD - seems like this should be done after ips_tid_recv_free
 	// so we have more likelihood of getting freshly freed resources?
 	if (tidrecvc->protoexp->tid_flags & IPS_PROTOEXP_FLAG_CTS_SERIALIZED) {
@@ -1304,19 +1301,41 @@ psmi_gpu_reclaim_hostbufs(struct ips_tid_get_request *getreq)
 	}
 	return PSM2_OK;
 }
-static
-struct ips_gpu_hostbuf* psmi_allocate_chb(uint32_t window_len)
+
+// allocate a chb control structure.  The actual buffer and event needed for the
+// DTOH async copy are allocated in chb's 1st use in PSM3_GPU_MEMCPY_DTOH_START
+struct ips_gpu_hostbuf* psm3_ips_allocate_send_chb(struct ips_proto *proto,
+				uint32_t nbytes, int allow_temp)
 {
-	struct ips_gpu_hostbuf* chb = (struct ips_gpu_hostbuf*)
-						psmi_calloc(PSMI_EP_NONE,
+	struct ips_gpu_hostbuf* chb = NULL;
+	unsigned bufsz;
+
+	if (nbytes <= GPU_SMALLHOSTBUF_SZ) {
+		chb = (struct ips_gpu_hostbuf *) psm3_mpool_get(
+			proto->gpu_hostbuf_pool_small_send);
+		bufsz = proto->gpu_hostbuf_small_send_cfg.bufsz;
+	}
+	if (chb == NULL) {
+		chb = (struct ips_gpu_hostbuf *) psm3_mpool_get(
+			proto->gpu_hostbuf_pool_send);
+		bufsz = proto->gpu_hostbuf_send_cfg.bufsz;
+	}
+
+	/* were any buffers available? If not force allocate */
+	if (chb == NULL && allow_temp) {
+		chb = (struct ips_gpu_hostbuf*) psmi_calloc(PSMI_EP_NONE,
 							    UNDEFINED, 1,
 							    sizeof(struct ips_gpu_hostbuf));
-	if_pf (chb == NULL) {
-		psm3_handle_error(PSMI_EP_NORETURN, PSM2_NO_MEMORY,
-						"Couldn't allocate cuda host buffers ");
-		return NULL;
+		if_pf (chb == NULL) {
+			psm3_handle_error(PSMI_EP_NORETURN, PSM2_NO_MEMORY,
+							"Couldn't allocate GPU host bounce buffers ");
+			return NULL;
+		}
+		chb->is_tempbuf = 1;
+		bufsz = nbytes;
 	}
-	PSM3_GPU_HOSTBUF_FORCE_INIT(chb, window_len);
+	if (chb && ! chb->host_buf)
+		PSM3_GPU_HOST_ALLOC(&chb->host_buf, bufsz);
 	return chb;
 }
 
@@ -1333,21 +1352,12 @@ void psmi_gpu_run_prefetcher(struct ips_protoexp *protoexp,
 	if (req->prefetch_send_msgoff < req->req_data.send_msglen) {
 		/* some data remains to be sent */
 		offset = req->prefetch_send_msgoff;
+		psmi_assert(req->is_buf_gpu_mem);
 		window_len =
 			ips_gpu_next_window(
-					     proto->mq->hfi_base_window_rv,
+					     psm3_mq_get_window_rv(req),
 					     offset, req->req_data.buf_len);
-		unsigned bufsz = 0;
-		if (window_len <= GPU_SMALLHOSTBUF_SZ) {
-			chb = (struct ips_gpu_hostbuf *) psm3_mpool_get(
-				proto->gpu_hostbuf_pool_small_send);
-			bufsz = proto->gpu_hostbuf_small_send_cfg.bufsz;
-		}
-		if (chb == NULL) {
-			chb = (struct ips_gpu_hostbuf *) psm3_mpool_get(
-				proto->gpu_hostbuf_pool_send);
-			bufsz = proto->gpu_hostbuf_send_cfg.bufsz;
-		}
+		chb = psm3_ips_allocate_send_chb(proto, window_len, 0);
 		/* were any buffers available for the prefetcher? */
 		if (chb == NULL)
 			return;
@@ -1358,7 +1368,7 @@ void psmi_gpu_run_prefetcher(struct ips_protoexp *protoexp,
 		chb->gpu_buf = (uint8_t*)req->req_data.buf + offset;
 		chb->bytes_read = 0;
 
-		PSM3_GPU_MEMCPY_DTOH_START(proto, chb, window_len, bufsz);
+		PSM3_GPU_MEMCPY_DTOH_START(proto, chb, window_len);
 
 		STAILQ_INSERT_TAIL(&req->sendreq_prefetch, chb, req_next);
 		return;
@@ -1373,7 +1383,6 @@ void psmi_attach_chb_to_tidsendc(struct ips_protoexp *protoexp,
 				 struct ips_gpu_hostbuf *chb_prev,
 				 uint32_t tsess_srcoff,
 				 uint32_t tsess_length,
-				 uint32_t tsess_unaligned_start,
 				 psm2_chb_match_type_t type)
 {
 	struct ips_proto *proto = protoexp->proto;
@@ -1384,28 +1393,13 @@ void psmi_attach_chb_to_tidsendc(struct ips_protoexp *protoexp,
 	while (req->prefetch_send_msgoff < tsess_srcoff + tsess_length) {
 		/* some data remains to be sent */
 		offset = req->prefetch_send_msgoff;
+		psmi_assert(req->is_buf_gpu_mem);
 		window_len =
 			ips_gpu_next_window(
-					     proto->mq->hfi_base_window_rv,
+					     psm3_mq_get_window_rv(req),
 					     offset, req->req_data.buf_len);
-		unsigned bufsz = 0;
-		if (window_len <= GPU_SMALLHOSTBUF_SZ) {
-			chb = (struct ips_gpu_hostbuf *) psm3_mpool_get(
-				proto->gpu_hostbuf_pool_small_send);
-			bufsz = proto->gpu_hostbuf_small_send_cfg.bufsz;
-		}
-		if (chb == NULL) {
-			chb = (struct ips_gpu_hostbuf *) psm3_mpool_get(
-				proto->gpu_hostbuf_pool_send);
-			bufsz = proto->gpu_hostbuf_send_cfg.bufsz;
-		}
-
-		/* were any buffers available? If not force allocate */
-		if (chb == NULL) {
-			chb = psmi_allocate_chb(window_len);
-			psmi_assert(chb);
-			chb->is_tempbuf = 1;
-		}
+		/* if no buffers available, force allocate of a temp buf */
+		chb = psm3_ips_allocate_send_chb(proto, window_len, 1);
 		req->prefetch_send_msgoff += window_len;
 		chb->offset = offset;
 		chb->size = window_len;
@@ -1413,49 +1407,58 @@ void psmi_attach_chb_to_tidsendc(struct ips_protoexp *protoexp,
 		chb->gpu_buf = (uint8_t*)req->req_data.buf + offset;
 		chb->bytes_read = 0;
 
-		PSM3_GPU_MEMCPY_DTOH_START(proto, chb, window_len, bufsz);
+		PSM3_GPU_MEMCPY_DTOH_START(proto, chb, window_len);
 
 		STAILQ_INSERT_TAIL(&req->sendreq_prefetch, chb, req_next);
 		if (type == PSMI_GPU_PARTIAL_MATCH_FOUND) {
+			// caller matched 1st chb, but needed more prefetched
+			// see if we have what we need now
 			if ((tsess_srcoff < chb->offset)
 			     && ((tsess_srcoff + tsess_length) > chb->offset)) {
+				// will collect the 2 prefetched chb's for this
+				// RDMA Write send into a single CPU temp buffer
+				// do alloc now, hoping to hide it behind GPU async copy to chb
 				tidsendc->gpu_hostbuf[0] = chb_prev;
 				tidsendc->gpu_hostbuf[1] = chb;
 				tidsendc->gpu_num_buf = 2;
-				void *buffer = psmi_malloc(PSMI_EP_NONE, UNDEFINED,
-						tsess_length);
+				tidsendc->gpu_split_buf = psm3_ips_allocate_send_chb(proto,
+											tsess_length, 1);
 				tidsendc->userbuf =
-					(void *)((uintptr_t) buffer);
+					(void *)((uintptr_t) tidsendc->gpu_split_buf->host_buf);
 				tidsendc->buffer =
-					(void *)((uintptr_t)tidsendc->userbuf +
-						tsess_unaligned_start);
+					(void *)((uintptr_t)tidsendc->userbuf);
 				return;
 			}
 		} else {
 			if (attached) {
+				// we attached one in prior loop, now have
+				// a second, should have what we need now
+				psmi_assert((tsess_srcoff + tsess_length) > chb->offset);
+				// will collect the 2 prefetched chb's for this
+				// RDMA Write send into a single CPU temp buffer
+				// do alloc now, hoping to hide it behind GPU async copy to chb
 				tidsendc->gpu_hostbuf[0] = chb_prev;
 				tidsendc->gpu_hostbuf[1] = chb;
 				tidsendc->gpu_num_buf = 2;
-				void *buffer = psmi_malloc(PSMI_EP_NONE, UNDEFINED,
-						tsess_length);
+				tidsendc->gpu_split_buf = psm3_ips_allocate_send_chb(proto,
+											tsess_length, 1);
 				tidsendc->userbuf =
-					(void *)((uintptr_t) buffer);
+					(void *)((uintptr_t) tidsendc->gpu_split_buf->host_buf);
 				tidsendc->buffer =
-					(void *)((uintptr_t)tidsendc->userbuf +
-						tsess_unaligned_start);
-				attached = 0;
+					(void *)((uintptr_t)tidsendc->userbuf);
 				return;
 			}
 			if ((tsess_srcoff > chb->offset)
 			    && (tsess_srcoff < (chb->offset + chb->size))
 			     && ((tsess_srcoff + tsess_length) > (chb->offset + chb->size))) {
+				// we prefetched one, but need another
 				chb_prev = chb;
 				attached = 1;
-				chb = NULL;
 				continue;
 			} else if ((chb->offset <= tsess_srcoff) &&
 				  ((tsess_srcoff + tsess_length) <=
 				   (chb->offset+chb->size))) {
+				// we prefetched one and have what we need
 				tidsendc->gpu_hostbuf[0] = chb;
 				tidsendc->gpu_hostbuf[1] = NULL;
 				tidsendc->gpu_num_buf = 1;
@@ -1463,11 +1466,9 @@ void psmi_attach_chb_to_tidsendc(struct ips_protoexp *protoexp,
 					(void *)((uintptr_t) chb->host_buf +
 						tsess_srcoff - chb->offset);
 				tidsendc->buffer =
-					(void *)((uintptr_t)tidsendc->userbuf +
-							tsess_unaligned_start );
+					(void *)((uintptr_t)tidsendc->userbuf);
 				return;
-			} else
-				chb = NULL;
+			}
 		}
 	}
 }
@@ -1546,7 +1547,7 @@ psm3_ips_tid_send_handle_tidreq(struct ips_protoexp *protoexp,
 #if defined(PSM_SOCKETS) && PSMI_HAL_INST_CNT == 1
 	psmi_assert_always(0);	// should not get here
 #elif defined(PSM_VERBS)
-	// for UD we do not need a ips_flow since we will use the RC QP and
+	// for verbs we do not need a ips_flow since we will use the RC QP and
 	// then will use our main flow for the final RV completion control msg
 	// The path record for use by RDMA will be selected when the connection
 	// is established
@@ -1575,11 +1576,11 @@ psm3_ips_tid_send_handle_tidreq(struct ips_protoexp *protoexp,
 	tidsendc->gpu_num_buf = 0;
 	if (req->gpu_hostbuf_used) {
 		/* To get a match:
-		 * 1. Tid list offset + length is contained within a chb
-		 * 2. Tid list offset + length is contained within
-		 * the prefetched offset of this req.
-		 * 3. Tid list offset + length is partially prefetched
-		 * within one chb. (A partial match)
+		 * 1. FULL - Tid list offset + length is contained within a chb
+		 * 2. SPLIT - Tid list offset + length is contained within
+		 * the prefetched offset of this req. (2 chb)
+		 * 3. PARTIAL - Tid list offset + length is partially prefetched
+		 * within one chb.
 		 */
 		STAILQ_FOREACH(chb, &req->sendreq_prefetch, req_next) {
 			rc = psmi_find_match_in_prefeteched_chb(chb,
@@ -1600,10 +1601,13 @@ psm3_ips_tid_send_handle_tidreq(struct ips_protoexp *protoexp,
 			tidsendc->gpu_hostbuf[1] = NULL;
 			tidsendc->gpu_num_buf = 1;
 		} else if (rc == PSMI_GPU_SPLIT_MATCH_FOUND){
-			void *buffer = psmi_malloc(PSMI_EP_NONE, UNDEFINED,
-					tid_list->tsess_length);
+			// will collect the 2 prefetched chb's for this
+			// RDMA Write send into a single CPU temp buffer
+			// do alloc now, hoping to hide it behind GPU async copy to chb
+			tidsendc->gpu_split_buf =psm3_ips_allocate_send_chb(protoexp->proto,
+										tid_list->tsess_length, 1);
 			tidsendc->userbuf =
-				(void *)((uintptr_t) buffer);
+				(void *)((uintptr_t) tidsendc->gpu_split_buf->host_buf);
 			tidsendc->buffer =
 				(void *)((uintptr_t)tidsendc->userbuf
 				);
@@ -1612,20 +1616,20 @@ psm3_ips_tid_send_handle_tidreq(struct ips_protoexp *protoexp,
 			tidsendc->gpu_hostbuf[1] = chb_next;
 			tidsendc->gpu_num_buf = 2;
 		} else if (rc == PSMI_GPU_PARTIAL_MATCH_FOUND) {
+			// need to prefetch more
 			psmi_attach_chb_to_tidsendc(protoexp, req,
 						    tidsendc,
 						    chb,
 						    tid_list->tsess_srcoff,
 						    tid_list->tsess_length,
-							0,
 						    rc);
 		} else {
+			// no match, need to prefetch
 			psmi_attach_chb_to_tidsendc(protoexp, req,
 						    tidsendc,
 						    NULL,
 						    tid_list->tsess_srcoff,
 						    tid_list->tsess_length,
-							0,
 						    PSMI_GPU_CONTINUE);
 		}
 		protoexp->proto->strat_stats.rndv_rdma_hbuf_send++;
@@ -1648,7 +1652,6 @@ psm3_ips_tid_send_handle_tidreq(struct ips_protoexp *protoexp,
 	tidsendc->rv_conn_count = 0;
 #endif
 
-
 	_HFI_EXP
 	    ("alloc tidsend=%4d tidrecv=%4d srcoff=%6d length=%6d"
 		"\n",
@@ -1656,7 +1659,7 @@ psm3_ips_tid_send_handle_tidreq(struct ips_protoexp *protoexp,
 	     tid_list->tsess_srcoff, tid_list->tsess_length
 		);
 
-	// start sending TIDEXP packets
+	// start sending RDMA packets
 	ips_tid_send_exp(tidsendc);
 
 	/* Add as a pending op and ring up the timer */
@@ -1696,12 +1699,9 @@ psm2_error_t ips_tid_issue_rdma_write(struct ips_tid_send_desc *tidsendc)
 	struct ips_proto *proto = protoexp->proto;
 	psm2_error_t err = PSM2_OK;
 
-	// for STL100 native we would loop on ips_scb_prepare_tid_sendctrl and
-	// ips_proto_flow_enqueue to prepare EXPTID scbs for the TIDFLOW protocol
-	// and queue and issue them.  Once they were all posted the is_complete
-	// flag would be set.  For larger messages, it might take multiple
-	// attempts to get resources to queue everything in which case callbacks
-	// and timers ensure progress
+	// for STL100 the EXPTID scbs were sent by software and had to loop
+	// to get and queue scbs for the STL100 TIDFLOW protocol.
+	// Once they were all posted the is_complete flag would be set.
 	// For verbs we are delegating the RC Write "flow" to the NIC's RC QP
 	// it will manage segmentation, sequence numbers and acks for the flow
 	// so our job is done here after one call.
@@ -1835,8 +1835,7 @@ psm2_error_t ips_tid_issue_rdma_write(struct ips_tid_send_desc *tidsendc)
  *
  */
 
-// we got a CTS and processed it.  Now we can start sending EXPTID packets.
-// For UD we will use RDMA instead of EXPTID
+// we got a CTS and processed it.  Now we can start sending RDMA packets.
 static
 psm2_error_t ips_tid_send_exp(struct ips_tid_send_desc *tidsendc)
 {
@@ -1849,6 +1848,7 @@ psm2_error_t ips_tid_send_exp(struct ips_tid_send_desc *tidsendc)
 #if defined(PSM_CUDA) || defined(PSM_ONEAPI)
 	struct ips_gpu_hostbuf *chb, *chb_next;
 	uint32_t offset_in_chb, i;
+	// wait for async copies into needed prefetcher chb's to finish
 	for (i = 0; i < tidsendc->gpu_num_buf; i++) {
 		chb = tidsendc->gpu_hostbuf[i];
 		if (chb) {
@@ -1864,8 +1864,9 @@ psm2_error_t ips_tid_send_exp(struct ips_tid_send_desc *tidsendc)
 		chb = tidsendc->gpu_hostbuf[0];
 		chb_next = tidsendc->gpu_hostbuf[1];
 		offset_in_chb = tidsendc->tid_list.tsess_srcoff - chb->offset;
-		/* Copying data from multiple cuda
-		 * host buffers into a bounce buffer.
+		/* Copying data from multiple prefetched
+		 * host buffers into a single temp CPU bounce buffer.
+		 * so can issue a single RDMA Write from the temp bounce buffer
 		 */
 		memcpy(tidsendc->buffer, (void *)((uintptr_t)chb->host_buf +
 			offset_in_chb), chb->size-offset_in_chb);
@@ -1881,29 +1882,13 @@ psm2_error_t ips_tid_send_exp(struct ips_tid_send_desc *tidsendc)
 		if(chb->bytes_read == chb->size) {
 			STAILQ_REMOVE(&tidsendc->mqreq->sendreq_prefetch, chb,
 				       ips_gpu_hostbuf, req_next);
-			if (chb->is_tempbuf)
-				psmi_deallocate_chb(chb);
-			else {
-				chb->req = NULL;
-				chb->offset = 0;
-				chb->bytes_read = 0;
-				PSM3_GPU_HOSTBUF_RESET(chb);
-				psm3_mpool_put(chb);
-			}
+			psm3_ips_deallocate_send_chb(chb, 1);
 			psmi_gpu_run_prefetcher(protoexp, tidsendc);
 		 }
 		if(chb_next->bytes_read == chb_next->size) {
 			STAILQ_REMOVE(&tidsendc->mqreq->sendreq_prefetch, chb_next,
 				       ips_gpu_hostbuf, req_next);
-			if (chb_next->is_tempbuf)
-				psmi_deallocate_chb(chb_next);
-			else{
-				chb_next->req = NULL;
-				chb_next->offset = 0;
-				chb_next->bytes_read = 0;
-				PSM3_GPU_HOSTBUF_RESET(chb_next);
-				psm3_mpool_put(chb_next);
-			}
+			psm3_ips_deallocate_send_chb(chb_next, 1);
 			psmi_gpu_run_prefetcher(protoexp, tidsendc);
 		}
 		/* Clean Up tidsendc ref's to split cuda hostbufs when no longer needed */
@@ -1962,7 +1947,7 @@ ips_tid_pendsend_timer_callback(struct psmi_timer *timer, uint64_t current)
 	while (!STAILQ_EMPTY(phead)) {
 		tidsendc = STAILQ_FIRST(phead);
 
-		// we have some scb's and can use them to queue some more EXPTID packets
+		// we have some scb's and can use them to queue some more packets
 #if defined(PSM_VERBS)
 #ifdef RNDV_MOD
 		if (tidsendc->rv_need_err_chk_rdma)
@@ -2007,15 +1992,6 @@ ips_tid_pendsend_timer_callback(struct psmi_timer *timer, uint64_t current)
 	return PSM2_OK;
 }
 #endif // PSM_HAVE_RDMA
-
-/* Right now, in the kernel we are allowing for virtually non-contiguous pages,
-   in a single call, and we are therefore locking one page at a time, but since
-   the intended use of this routine is for a single group of
-   virtually contiguous pages, that should change to improve
-   performance.  That means possibly changing the calling MPI code.
-   Doing so gets rid of some of the loop stuff here, and in the driver,
-   and allows for a single call to the core VM code in the kernel,
-   rather than one per page, definitely improving performance. */
 
 
 static
@@ -2190,8 +2166,10 @@ ips_tid_recv_alloc(struct ips_protoexp *protoexp,
 	tidrecvc->stats.nReXmit = 0;
 	tidrecvc->stats.nErrChkReceived = 0;
 
-	_HFI_EXP("alloc tidrecv=%d\n",
-		 tidrecvc->rdescid._desc_idx);
+	_HFI_EXP("alloc tidrecv=%d srcoff=%u length=%u\n",
+		 tidrecvc->rdescid._desc_idx,
+		 tidrecvc->tid_list.tsess_srcoff,
+		 tidrecvc->tid_list.tsess_length);
 
 	tidrecvc->grantscb = grantscb;
 
@@ -2243,9 +2221,8 @@ ips_tid_pendtids_timer_callback(struct psmi_timer *timer, uint64_t current)
 #endif
 
 #if defined(PSM_CUDA) || defined(PSM_ONEAPI)
-	if (
-	    1	/* due to unaligned recv using hostbuf, must always do this */
-	) {
+	/* due to unaligned recv using hostbuf, must always do this */
+	{
 		/* Before processing pending TID requests, first try to free up
 		 * any GPU host buffers that are now idle. */
 		struct ips_tid_get_gpupend *cphead =
@@ -2374,8 +2351,7 @@ ipsaddr_next:
 
 		psmi_assert(nbytes_this >= 4);
 
-		// for STL native the tids and tidflows available pace incoming TIDs
-		// for UD we still use tidflows available to pace incoming RDMA
+		// for verbs we use tidflows available to pace incoming RDMA
 			if ((ret = ips_tf_available(&protoexp->tfc)) <= 0) {
 			/* We're out of tidflow. If this process used all the resource,
 			 * the free callback will reschedule the operation, otherwise,
@@ -2558,6 +2534,3 @@ psm2_error_t ips_tid_recv_free(struct ips_tid_recv_desc *tidrecvc)
 	return err;
 }
 #endif // PSM_HAVE_RDMA
-
-
-

@@ -58,6 +58,7 @@ size_t rxm_packet_size;
 int rxm_passthru = 0; /* disable by default, need to analyze performance */
 int force_auto_progress;
 int rxm_use_write_rndv;
+int rxm_detect_hmem_iface;
 enum fi_wait_obj def_wait_obj = FI_WAIT_FD, def_tcp_wait_obj = FI_WAIT_UNSPEC;
 
 char *rxm_proto_state_str[] = {
@@ -83,12 +84,12 @@ void rxm_info_to_core_mr_modes(uint32_t version, const struct fi_info *hints,
 			       struct fi_info *core_info)
 {
 	if (hints && hints->domain_attr &&
-	    (hints->domain_attr->mr_mode & (FI_MR_SCALABLE | FI_MR_BASIC))) {
-		core_info->mode |= FI_LOCAL_MR;
+	    (hints->domain_attr->mr_mode & (OFI_MR_SCALABLE | OFI_MR_BASIC))) {
+		core_info->mode |= OFI_LOCAL_MR;
 		core_info->domain_attr->mr_mode = hints->domain_attr->mr_mode;
 	} else if (FI_VERSION_LT(version, FI_VERSION(1, 5))) {
-		core_info->mode |= FI_LOCAL_MR;
-		core_info->domain_attr->mr_mode = FI_MR_UNSPEC;
+		core_info->mode |= OFI_LOCAL_MR;
+		core_info->domain_attr->mr_mode = OFI_MR_UNSPEC;
 	} else {
 		core_info->domain_attr->mr_mode |= FI_MR_LOCAL;
 		if (!hints || !hints->domain_attr ||
@@ -232,13 +233,11 @@ int rxm_info_to_core(uint32_t version, const struct fi_info *hints,
 			core_info->tx_attr->op_flags =
 				hints->tx_attr->op_flags & RXM_PASSTHRU_TX_OP_FLAGS;
 			core_info->tx_attr->msg_order = hints->tx_attr->msg_order;
-			core_info->tx_attr->comp_order = hints->tx_attr->comp_order;
 		}
 		if (hints->rx_attr) {
 			core_info->rx_attr->op_flags =
 				hints->rx_attr->op_flags & RXM_PASSTHRU_RX_OP_FLAGS;
 			core_info->rx_attr->msg_order = hints->rx_attr->msg_order;
-			core_info->rx_attr->comp_order = hints->rx_attr->comp_order;
 		}
 		if ((hints->caps & FI_HMEM) && ofi_hmem_p2p_disabled())
 			return -FI_ENODATA;
@@ -274,11 +273,9 @@ rxm_info_thru_rxm(uint32_t version, const struct fi_info *core_info,
 	info->mode = core_info->mode;
 
 	*info->tx_attr = *core_info->tx_attr;
-	info->tx_attr->comp_order = base_info->tx_attr->comp_order;
 	info->tx_attr->size = MIN(base_info->tx_attr->size, rxm_def_tx_size);
 
 	*info->rx_attr = *core_info->rx_attr;
-	info->rx_attr->comp_order = base_info->rx_attr->comp_order;
 	info->rx_attr->size = MIN(base_info->rx_attr->size, rxm_def_rx_size);
 
 	*info->ep_attr = *base_info->ep_attr;
@@ -320,7 +317,6 @@ int rxm_info_to_rxm(uint32_t version, const struct fi_info *core_info,
 	info->tx_attr->caps		= base_info->tx_attr->caps;
 	info->tx_attr->mode		= info->mode;
 	info->tx_attr->msg_order 	= core_info->tx_attr->msg_order;
-	info->tx_attr->comp_order 	= base_info->tx_attr->comp_order;
 
 	/* If the core provider requires registering send buffers, it's
 	 * usually faster to copy small transfer through bounce buffers
@@ -355,7 +351,6 @@ int rxm_info_to_rxm(uint32_t version, const struct fi_info *core_info,
 	info->rx_attr->caps		= base_info->rx_attr->caps;
 	info->rx_attr->mode		= info->rx_attr->mode & ~FI_RX_CQ_DATA;
 	info->rx_attr->msg_order 	= core_info->rx_attr->msg_order;
-	info->rx_attr->comp_order 	= base_info->rx_attr->comp_order;
 	info->rx_attr->iov_limit 	= MIN(base_info->rx_attr->iov_limit,
 					      core_info->rx_attr->iov_limit);
 
@@ -461,8 +456,8 @@ static void rxm_alter_info(const struct fi_info *hints, struct fi_info *info)
 				cur->rx_attr->caps &= ~FI_DIRECTED_RECV;
 			}
 
-			if (hints->mode & FI_BUFFERED_RECV)
-				cur->mode |= FI_BUFFERED_RECV;
+			if (hints->mode & OFI_BUFFERED_RECV)
+				cur->mode |= OFI_BUFFERED_RECV;
 
 			if (hints->caps & FI_ATOMIC) {
 				cur->tx_attr->msg_order &=
@@ -479,9 +474,9 @@ static void rxm_alter_info(const struct fi_info *hints, struct fi_info *info)
 			}
 
 			if (!ofi_mr_local(hints)) {
-				cur->mode &= ~FI_LOCAL_MR;
-				cur->tx_attr->mode &= ~FI_LOCAL_MR;
-				cur->rx_attr->mode &= ~FI_LOCAL_MR;
+				cur->mode &= ~OFI_LOCAL_MR;
+				cur->tx_attr->mode &= ~OFI_LOCAL_MR;
+				cur->rx_attr->mode &= ~OFI_LOCAL_MR;
 				cur->domain_attr->mr_mode &= ~FI_MR_LOCAL;
 			}
 
@@ -700,6 +695,11 @@ RXM_INI
 			"to the tcp provider, depending on the capabilities "
 			"requested by the application.");
 
+	fi_param_define(&rxm_prov, "detect_hmem_iface", FI_PARAM_BOOL,
+			"Detect iface for user buffers with NULL desc passed "
+			"in. This allows such buffers be copied or registered "
+			"internally by RxM. (default: false).");
+
 	/* passthru supported disabled - to re-enable would need to fix call to
 	 * fi_cq_read to pass in the correct data structure.  However, passthru
 	 * will not be needed at all with in-work tcp changes.
@@ -724,6 +724,8 @@ RXM_INI
 		FI_INFO(&rxm_prov, FI_LOG_CORE, "auto-progress for data requested "
 			"(FI_OFI_RXM_DATA_AUTO_PROGRESS = 1), domain threading "
 			"level would be set to FI_THREAD_SAFE\n");
+
+	fi_param_get_bool(&rxm_prov, "detect_hmem_iface", &rxm_detect_hmem_iface);
 
 #if HAVE_RXM_DL
 	ofi_mem_init();

@@ -320,11 +320,11 @@ static int psmx3_check_multi_ep_cap(void)
 {
 	uint64_t caps = PSM2_MULTI_EP_CAP;
 	char *s = NULL;
+	int val = 1; /* if parses as empty (-1) or invalid (-2), use default of 1 */
 
 	s = psm3_env_get("PSM3_MULTI_EP");
-	/* if parses as empty or invalid (-1), use default of 1 */
-	/* psm3 below us will provide warning as needed when it parses it */
-	if (psm3_get_capability_mask(caps) == caps && 0 != psm3_parse_str_yesno(s))
+	/* psm3 below us will provide warning as needed when it parses it again */
+	if (psm3_get_capability_mask(caps) == caps && (psm3_parse_str_yesno(s, &val) || val))
 		psmx3_env.multi_ep = 1;
 	else
 		psmx3_env.multi_ep = 0;
@@ -391,16 +391,12 @@ out:
 static int psmx3_update_hfi_info(void)
 {
 	unsigned short i, j, psmx3_unit;
-	int nctxts = 0;
-	int nfreectxts = 0;
 	int multirail = 0;
-	int counted_unit;
 	char *s = NULL;
 	char unit_name[NAME_MAX];
 	char fabric_name[NAME_MAX];
 	uint32_t cnt = 0;
 	uint32_t addr_cnt = 0;
-	int tmp_nctxts, tmp_nfreectxts;
 	int unit_active;
 	int ret;
 	psm2_info_query_arg_t args[4];
@@ -438,7 +434,7 @@ static int psmx3_update_hfi_info(void)
 	// if parses as empty or invalid (-1), use default of 0 */
 	// PSM3 below us will provide warning as needed when it parses it
 	s = psm3_env_get("PSM3_MULTIRAIL");
-	(void)psm3_parse_str_int(s, &multirail);
+	(void)psm3_parse_str_int(s, &multirail, INT_MIN, INT_MAX);
 
 	psmx3_domain_info.num_reported_units = 0;
 	psmx3_domain_info.num_active_units = 0;
@@ -459,25 +455,6 @@ static int psmx3_update_hfi_info(void)
 			continue;
 		}
 
-		if (PSM2_OK != psm3_info_query(PSM2_INFO_QUERY_NUM_FREE_CONTEXTS,
-						&tmp_nfreectxts, 1, args) || (tmp_nfreectxts < 0))
-		{
-			PSMX3_WARN(&psmx3_prov, FI_LOG_CORE,
-				"Failed to read number of free contexts from HFI unit_id %d\n",
-				i);
-			continue;
-		}
-
-		if (PSM2_OK != psm3_info_query(PSM2_INFO_QUERY_NUM_CONTEXTS,
-						&tmp_nctxts, 1, args) || (tmp_nctxts < 0))
-		{
-			PSMX3_WARN(&psmx3_prov, FI_LOG_CORE,
-				"Failed to read number of contexts from HFI unit_id %d\n",
-				i);
-			continue;
-		}
-
-		counted_unit = 0;
 		for (j=0; j < addr_cnt; j++) {
 			psmx3_unit = i * addr_cnt + j;
 			args[1].port = 1;	// VERBS_PORT
@@ -506,12 +483,6 @@ static int psmx3_update_hfi_info(void)
 				continue;
 			}
 
-			if (! counted_unit) {
-				nctxts += tmp_nctxts;
-				nfreectxts += tmp_nfreectxts;
-				counted_unit = 1;
-			}
-
 			psmx3_domain_info.num_active_units++;
 
 			/* for PSM3_MULTIRAIL only report 1 "autoselect" unit */
@@ -519,8 +490,6 @@ static int psmx3_update_hfi_info(void)
 				psmx3_domain_info.unit_is_active[psmx3_unit] = 1;
 				psmx3_domain_info.unit_id[psmx3_unit] = i;
 				psmx3_domain_info.addr_index[psmx3_unit] = j;
-				psmx3_domain_info.unit_nctxts[psmx3_unit] = tmp_nctxts;
-				psmx3_domain_info.unit_nfreectxts[psmx3_unit] = tmp_nfreectxts;
 				psmx3_domain_info.active_units[psmx3_domain_info.num_reported_units++] = psmx3_unit;
 			}
 			if (psmx3_domain_info.num_active_units == 1) {
@@ -554,22 +523,19 @@ static int psmx3_update_hfi_info(void)
 	}
 
 	PSMX3_INFO(&psmx3_prov, FI_LOG_CORE,
-		"hfi1 units: total %d, reported %d, active %d; "
-		"hfi1 contexts: total %d, free %d\n",
+		"psm3 units: total %d, reported %d, active %d\n",
 		psmx3_domain_info.num_units, psmx3_domain_info.num_reported_units,
-		psmx3_domain_info.num_active_units, nctxts, nfreectxts);
+		psmx3_domain_info.num_active_units);
 
 	if (psmx3_env.multi_ep) {
-		psmx3_domain_info.max_trx_ctxt = nctxts;
-		psmx3_domain_info.free_trx_ctxt = nfreectxts;
+		psmx3_domain_info.max_trx_ctxt = PSMX3_MAX_EPS;
 	} else {
 		psmx3_domain_info.max_trx_ctxt = 1;
-		psmx3_domain_info.free_trx_ctxt = (nfreectxts == 0) ? 0 : 1;
 	}
 
 	PSMX3_INFO(&psmx3_prov, FI_LOG_CORE,
-		"Tx/Rx contexts: %d in total, %d available.\n",
-		psmx3_domain_info.max_trx_ctxt, psmx3_domain_info.free_trx_ctxt);
+		"Tx/Rx contexts: %d allowed per process.\n",
+		psmx3_domain_info.max_trx_ctxt);
 
 	return 0;
 }
@@ -699,6 +665,7 @@ static void psmx3_update_nic_info(struct fi_info *info)
 	}
 }
 
+static int init_calls;
 static int psmx3_getinfo(uint32_t api_version, const char *node,
 			 const char *service, uint64_t flags,
 			 const struct fi_info *hints, struct fi_info **info)
@@ -739,6 +706,8 @@ static int psmx3_getinfo(uint32_t api_version, const char *node,
 			"no PSM3 device is active.\n");
 		goto err_out;
 	}
+
+	init_calls += 1;
 
 	/* when available, default domain and fabric names are a superset
 	 * of all individual names, so we can do a substr search as a 1st level
@@ -872,6 +841,9 @@ static int psmx3_getinfo(uint32_t api_version, const char *node,
 	*info = prov_info;
 	free(src_addr);
 	free(dest_addr);
+	if (hints || init_calls >= 2) {
+		psm3_turn_off_init_cache();
+	}
 	return 0;
 
 err_out:

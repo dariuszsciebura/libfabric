@@ -65,6 +65,7 @@
 	_(cuGetErrorName)		\
 	_(cuGetErrorString)		\
 	_(cuPointerGetAttribute)	\
+	_(cuPointerGetAttributes)	\
 	_(cuPointerSetAttribute)	\
 	_(cuDeviceCanAccessPeer)	\
 	_(cuMemGetAddressRange)		\
@@ -125,6 +126,10 @@ static struct {
 	CUresult (*cuGetErrorString)(CUresult error, const char** pStr);
 	CUresult (*cuPointerGetAttribute)(void *data,
 					  CUpointer_attribute attribute,
+					  CUdeviceptr ptr);
+	CUresult (*cuPointerGetAttributes)(unsigned int num_attributes,
+					  CUpointer_attribute *attributes,
+					  void **data,
 					  CUdeviceptr ptr);
 	CUresult (*cuPointerSetAttribute)(const void *data,
 					  CUpointer_attribute attribute,
@@ -220,6 +225,14 @@ CUresult ofi_cuPointerGetAttribute(void *data, CUpointer_attribute attribute,
 				   CUdeviceptr ptr)
 {
 	return cuda_ops.cuPointerGetAttribute(data, attribute, ptr);
+}
+
+CUresult ofi_cuPointerGetAttributes(unsigned int num_attributes,
+				    CUpointer_attribute *attributes,
+				    void **data, CUdeviceptr ptr)
+{
+	return cuda_ops.cuPointerGetAttributes(num_attributes, attributes,
+					       data, ptr);
 }
 
 #define CUDA_DRIVER_LOG_ERR(cu_result, cuda_api_name) 			\
@@ -407,7 +420,7 @@ int cuda_open_handle(void **handle, size_t size, uint64_t device,
 	return (cuda_ret == cudaErrorAlreadyMapped) ? -FI_EALREADY:-FI_EINVAL;
 }
 
-int cuda_close_handle(void *ipc_ptr)
+int cuda_close_handle(void *ipc_ptr, void **handle)
 {
 	cudaError_t cuda_ret;
 
@@ -483,12 +496,12 @@ static int cuda_hmem_dl_init(void)
 
 	cuda_attr.nvml_handle = dlopen("libnvidia-ml.so", RTLD_NOW);
 	if (!cuda_attr.nvml_handle) {
-		FI_WARN(&core_prov, FI_LOG_CORE,
+		FI_INFO(&core_prov, FI_LOG_CORE,
 			"Failed to dlopen libnvidia-ml.so.  Trying libnvidia-ml.so.1\n");
 		cuda_attr.nvml_handle = dlopen("libnvidia-ml.so.1", RTLD_NOW);
 		if (!cuda_attr.nvml_handle) {
 			FI_WARN(&core_prov, FI_LOG_CORE,
-			"Failed to dlopen libnvidia-ml.so.1 also, bypassing nvml calls\n");
+			"Failed to dlopen libnvidia-ml.so or libnvidia-ml.so.1, bypassing nvml calls\n");
 		}
 	}
 
@@ -627,12 +640,7 @@ static int cuda_hmem_detect_p2p_access_support(void)
 		peer = dev + 1;
 		cuda_ret = ofi_cuDeviceCanAccessPeer(&can_access_peer, dev, peer);
 		if (CUDA_SUCCESS != cuda_ret) {
-			FI_WARN(&core_prov, FI_LOG_CORE,
-				"Failed to detect support for peer-to-peer "
-				"access between CUDA devices via "
-				"cuDeviceCanAccessPeer(): %s:%s\n",
-				ofi_cudaGetErrorName((cudaError_t)cuda_ret),
-				ofi_cudaGetErrorString((cudaError_t)cuda_ret));
+			CUDA_DRIVER_LOG_ERR(cuda_ret, "cuDeviceCanAccessPeer");
 			return -FI_EIO;
 		}
 		FI_INFO(&core_prov, FI_LOG_CORE,
@@ -755,6 +763,9 @@ int cuda_hmem_init(void)
 			"If libfabric is not compiled with gdrcopy support, "
 			"this variable is not checked. (default: true)");
 
+	fi_param_define(NULL, "hmem_cuda_use_dmabuf", FI_PARAM_BOOL,
+			"Use dma-buf for sharing buffer with hardware. (default:true)");
+
 	ret = cuda_hmem_dl_init();
 	if (ret != FI_SUCCESS)
 		return ret;
@@ -815,26 +826,33 @@ int cuda_hmem_cleanup(void)
 bool cuda_is_addr_valid(const void *addr, uint64_t *device, uint64_t *flags)
 {
 	CUresult cuda_ret;
-	unsigned int data;
+	unsigned int mem_type;
+	unsigned int is_managed;
+	uint64_t device_ord;
 
-	cuda_ret = ofi_cuPointerGetAttribute(&data,
-					     CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
-					     (CUdeviceptr)addr);
+	/* Each pointer in 'data' needs to have the same array index
+		as the corresponding attribute in 'cuda_attributes' */
+	void *data[] = {&mem_type, &is_managed, &device_ord};
+
+	CUpointer_attribute cuda_attributes[] = {
+		CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+		CU_POINTER_ATTRIBUTE_IS_MANAGED,
+		CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL
+	};
+
+	cuda_ret = ofi_cuPointerGetAttributes(ARRAY_SIZE(cuda_attributes),
+					      cuda_attributes, data,
+					      (CUdeviceptr) addr);
+
 	switch (cuda_ret) {
 	case CUDA_SUCCESS:
-		if (data == CU_MEMORYTYPE_DEVICE) {
-			if (flags)
+		if (mem_type == CU_MEMORYTYPE_DEVICE) {
+			if (flags && !is_managed)
 				*flags = FI_HMEM_DEVICE_ONLY;
 
-			if (device) {
-				*device = 0;
-				cuda_ret = ofi_cuPointerGetAttribute(
-						(int *) device,
-						CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
-						(CUdeviceptr) addr);
-				if (cuda_ret)
-					break;
-			}
+			if (device)
+				*device = device_ord;
+
 			return true;
 		}
 		break;
@@ -921,7 +939,11 @@ bool cuda_is_gdrcopy_enabled(void)
 
 bool cuda_is_dmabuf_supported(void)
 {
-	return cuda_attr.dmabuf_supported;
+	int use_dmabuf = 1;
+
+	fi_param_get_bool(NULL, "hmem_cuda_use_dmabuf", &use_dmabuf);
+
+	return use_dmabuf && cuda_attr.dmabuf_supported;
 }
 
 #else
@@ -994,7 +1016,7 @@ int cuda_open_handle(void **handle, size_t size, uint64_t device,
 	return -FI_ENOSYS;
 }
 
-int cuda_close_handle(void *ipc_ptr)
+int cuda_close_handle(void *ipc_ptr, void **handle)
 {
 	return -FI_ENOSYS;
 }

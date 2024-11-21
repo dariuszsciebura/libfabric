@@ -371,8 +371,7 @@ struct fi_domain_attr {
     struct fid_domain *domain;
     char *name;
     enum fi_threading threading;
-    enum fi_progress control_progress;
-    enum fi_progress data_progress;
+    enum fi_progress progress;
     enum fi_resource_mgmt resource_mgmt;
     enum fi_av_type av_type;
     enum fi_mr_mode mr_mode;
@@ -755,7 +754,6 @@ struct fi_rx_attr {
     uint64_t mode;
     uint64_t op_flags;
     uint64_t msg_order;
-    uint64_t comp_order;
     ...
 };
 
@@ -764,7 +762,6 @@ struct fi_tx_attr {
     uint64_t mode;
     uint64_t op_flags;
     uint64_t msg_order;
-    uint64_t comp_order;
     size_t inject_size;
     ...
 };
@@ -947,7 +944,11 @@ struct fi_cq_err_entry {
 /* Sample error handling */
 struct fi_cq_msg_entry entry;
 struct fi_cq_err_entry err_entry;
+char err_data[256];
 int ret;
+
+err_entry.err_data = err_data;
+err_entry.err_data_size = 256;
 
 ret = fi_cq_read(cq, &entry, 1);
 if (ret == -FI_EAVAIL)

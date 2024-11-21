@@ -50,7 +50,6 @@ static struct fi_tx_attr psmx3_tx_attr = {
 	.mode			= FI_CONTEXT, /* 0 */
 	.op_flags		= PSMX3_OP_FLAGS,
 	.msg_order		= PSMX3_MSG_ORDER,
-	.comp_order		= PSMX3_COMP_ORDER,
 	.inject_size		= 64, /* psmx3_env.inject_size */
 	.size			= UINT64_MAX,
 	.iov_limit		= PSMX3_IOV_MAX_COUNT,
@@ -62,8 +61,6 @@ static struct fi_rx_attr psmx3_rx_attr = {
 	.mode			= FI_CONTEXT, /* 0 */
 	.op_flags		= PSMX3_OP_FLAGS,
 	.msg_order		= PSMX3_MSG_ORDER,
-	.comp_order		= PSMX3_COMP_ORDER,
-	.total_buffered_recv	= UINT64_MAX,
 	.size			= UINT64_MAX,
 	.iov_limit		= 1,
 };
@@ -92,13 +89,13 @@ static struct fi_domain_attr psmx3_domain_attr = {
 	.data_progress		= FI_PROGRESS_AUTO,
 	.resource_mgmt		= FI_RM_ENABLED,
 	.av_type		= FI_AV_UNSPEC,
-	.mr_mode		= FI_MR_SCALABLE | FI_MR_BASIC,
+	.mr_mode		= OFI_MR_SCALABLE | OFI_MR_BASIC,
 	.mr_key_size		= sizeof(uint64_t),
 	.cq_data_size		= 0, /* 4, 8 */
 	.cq_cnt			= 65535,
 	.ep_cnt			= 65535,
-	.tx_ctx_cnt		= 1, /* psmx3_domain_info.free_trx_ctxt */
-	.rx_ctx_cnt		= 1, /* psmx3_domain_info.free_trx_ctxt */
+	.tx_ctx_cnt		= 1, /* psmx3_domain_info.max_trx_ctxt */
+	.rx_ctx_cnt		= 1, /* psmx3_domain_info.max_trx_ctxt */
 	.max_ep_tx_ctx		= 1, /* psmx3_domain_info.max_trx_ctxt */
 	.max_ep_rx_ctx		= 1, /* psmx3_domain_info.max_trx_ctxt */
 	.max_ep_stx_ctx		= 1, /* psmx3_domain_info.max_trx_ctxt */
@@ -272,15 +269,85 @@ static uint64_t psmx3_check_fi_hmem_cap(void) {
 	int gpu = 0;
 	unsigned int gpudirect = 0;
 #ifdef PSM_CUDA
-	(void)psm3_parse_str_int(psm3_env_get("PSM3_CUDA"), &gpu);
+	(void)psm3_parse_str_int(psm3_env_get("PSM3_CUDA"), &gpu, INT_MIN, INT_MAX);
 #else /* PSM_ONEAPI */
-	(void)psm3_parse_str_int(psm3_env_get("PSM3_ONEAPI_ZE"), &gpu);
+	(void)psm3_parse_str_int(psm3_env_get("PSM3_ONEAPI_ZE"), &gpu,
+							INT_MIN, INT_MAX);
 #endif
-	(void)psm3_parse_str_uint(psm3_env_get("PSM3_GPUDIRECT"), &gpudirect);
+	(void)psm3_parse_str_uint(psm3_env_get("PSM3_GPUDIRECT"), &gpudirect,
+							0, UINT_MAX);
 	if ((gpu || gpudirect) && !ofi_hmem_p2p_disabled())
 		return FI_HMEM;
 #endif /* PSM_CUDA || PSM_ONEAPI */
 	return 0;
+}
+
+static uint64_t get_max_inject_size(void) {
+	unsigned int thresh_rv;
+	unsigned int temp;
+	int have_shm = 1;
+	int have_nic = 1;
+	int devid_enabled[PTL_MAX_INIT];
+
+	// check PSM3_DEVICES to determine if PSM3 shm enabled
+	if ((PSM2_OK == psm3_parse_devices(devid_enabled))) {
+		have_shm = psm3_device_is_enabled(devid_enabled, PTL_DEVID_AMSH);
+		have_nic = psm3_device_is_enabled(devid_enabled, PTL_DEVID_IPS);
+	}
+
+	// figure out the smallest rendezvous threshold (GPU vs CPU ips vs shm)
+	// If middleware above is not using PSM3 for shm but leaves it in
+	// PSM3_DEVICES, this could be more restrictive than necessary,
+	// but it's safe.  Note that PSM3_DEVICES can't be set per EP open.
+	// Also not yet sure which HAL will be selected so must pick most
+	// conservative ips (NIC) config
+	thresh_rv = 65536;	// default in odd case of PSM3_DEVICES=self
+
+	if (have_nic) {
+		temp = PSM3_MQ_RNDV_NIC_THRESH;
+		psm3_parse_str_uint(psm3_env_get("PSM3_MQ_RNDV_NIC_THRESH"), &temp,
+							0, UINT_MAX);
+		if (thresh_rv > temp)
+			thresh_rv = temp;
+	}
+
+	if (have_shm) {
+		temp = PSM3_MQ_RNDV_SHM_THRESH;
+		psm3_parse_str_uint(psm3_env_get("PSM3_MQ_RNDV_SHM_THRESH"), &temp,
+							0, UINT_MAX);
+		if (thresh_rv > temp)
+			thresh_rv = temp;
+	}
+
+#if defined(PSM_CUDA) || defined(PSM_ONEAPI)
+	if (psmx3_prov_info.caps & FI_HMEM) {
+		if (have_nic) {
+			// GPU ips rendezvous threshold
+			// sockets HAL avoids rendezvous, so this may be overly restrictive
+			temp = PSM3_GPU_THRESH_RNDV;
+			// PSM3_CUDA_THRESH_RNDV depricated, use PSM3_GPU_THRESH_RNDV if set
+			psm3_parse_str_uint(psm3_env_get("PSM3_CUDA_THRESH_RNDV"), &temp,
+								0, UINT_MAX);
+			psm3_parse_str_uint(psm3_env_get("PSM3_GPU_THRESH_RNDV"), &temp,
+								0, UINT_MAX);
+			if (thresh_rv > temp)
+				thresh_rv = temp;
+		}
+
+		if (have_shm) {
+			// GPU shm rendezvous threshold
+			temp = PSM3_MQ_RNDV_SHM_GPU_THRESH;
+			psm3_parse_str_uint(psm3_env_get("PSM3_MQ_RNDV_SHM_GPU_THRESH"), &temp,
+								0, UINT_MAX);
+			if (thresh_rv > temp)
+				thresh_rv = temp;
+		}
+	}
+#endif
+
+	// messages <= thresh_rv guaranteed to use eager, so thresh_rv
+	// is the max allowed inject_size.
+	return thresh_rv;
 }
 
 /*
@@ -496,6 +563,8 @@ void psmx3_update_prov_info(struct fi_info *info,
 			    struct psmx3_ep_name *dest_addr)
 {
 	struct fi_info *p;
+	unsigned int max_inject_size;
+	unsigned int inject_size;
 
 	for (p = info; p; p = p->next) {
 		psmx3_dup_addr(p->addr_format, src_addr,
@@ -506,6 +575,15 @@ void psmx3_update_prov_info(struct fi_info *info,
 
 	psmx3_expand_default_unit(info);
 
+	max_inject_size = get_max_inject_size();
+	if (psmx3_env.inject_size > max_inject_size)
+		inject_size = max_inject_size;
+	else
+		inject_size = psmx3_env.inject_size;
+	PSMX3_INFO(&psmx3_prov, FI_LOG_CORE,
+		"Using inject_size=%u based on FI_PSM3_INJECT_SIZE=%u with max %u\n",
+		inject_size, psmx3_env.inject_size, max_inject_size);
+
 	for (p = info; p; p = p->next) {
 		int unit = ((struct psmx3_ep_name *)p->src_addr)->unit;
 		int port = ((struct psmx3_ep_name *)p->src_addr)->port;
@@ -515,19 +593,11 @@ void psmx3_update_prov_info(struct fi_info *info,
 		    ! psmx3_domain_info.default_domain_name[0])
 			unit = 0;
 
-		if (unit == PSMX3_DEFAULT_UNIT || !psmx3_env.multi_ep) {
-			p->domain_attr->tx_ctx_cnt = psmx3_domain_info.free_trx_ctxt;
-			p->domain_attr->rx_ctx_cnt = psmx3_domain_info.free_trx_ctxt;
-			p->domain_attr->max_ep_tx_ctx = psmx3_domain_info.max_trx_ctxt;
-			p->domain_attr->max_ep_rx_ctx = psmx3_domain_info.max_trx_ctxt;
-			p->domain_attr->max_ep_stx_ctx = psmx3_domain_info.max_trx_ctxt;
-		} else {
-			p->domain_attr->tx_ctx_cnt = psmx3_domain_info.unit_nfreectxts[unit];
-			p->domain_attr->rx_ctx_cnt = psmx3_domain_info.unit_nfreectxts[unit];
-			p->domain_attr->max_ep_tx_ctx = psmx3_domain_info.unit_nctxts[unit];
-			p->domain_attr->max_ep_rx_ctx = psmx3_domain_info.unit_nctxts[unit];
-			p->domain_attr->max_ep_stx_ctx = psmx3_domain_info.unit_nctxts[unit];
-		}
+		p->domain_attr->tx_ctx_cnt = psmx3_domain_info.max_trx_ctxt;
+		p->domain_attr->rx_ctx_cnt = psmx3_domain_info.max_trx_ctxt;
+		p->domain_attr->max_ep_tx_ctx = psmx3_domain_info.max_trx_ctxt;
+		p->domain_attr->max_ep_rx_ctx = psmx3_domain_info.max_trx_ctxt;
+		p->domain_attr->max_ep_stx_ctx = psmx3_domain_info.max_trx_ctxt;
 
 		free(p->domain_attr->name);
 		if (unit == PSMX3_DEFAULT_UNIT)
@@ -539,7 +609,7 @@ void psmx3_update_prov_info(struct fi_info *info,
 			int addr_index = psmx3_domain_info.addr_index[unit];
 
 			args[0].unit = unit_id;
-			args[1].port = port;
+			args[1].port = port == PSMX3_DEFAULT_PORT ? 1 : port;
 			args[2].addr_index = addr_index;
 			args[3].length = sizeof(unit_name);
 
@@ -571,7 +641,7 @@ void psmx3_update_prov_info(struct fi_info *info,
 			int addr_index = psmx3_domain_info.addr_index[unit];
 
 			args[0].unit = unit_id;
-			args[1].port = port;
+			args[1].port = port == PSMX3_DEFAULT_PORT ? 1 : port;
 			args[2].addr_index = addr_index;
 			args[3].length = sizeof(fabric_name);
 
@@ -591,7 +661,7 @@ void psmx3_update_prov_info(struct fi_info *info,
 			}
 		}
 
-		p->tx_attr->inject_size = psmx3_env.inject_size;
+		p->tx_attr->inject_size = inject_size;
 	}
 }
 
@@ -673,8 +743,8 @@ void psmx3_alter_prov_info(uint32_t api_version,
 			info->domain_attr->data_progress =
 				FI_PROGRESS_MANUAL;
 
-		if (info->domain_attr->mr_mode == (FI_MR_BASIC | FI_MR_SCALABLE))
-			info->domain_attr->mr_mode = FI_MR_SCALABLE;
+		if (info->domain_attr->mr_mode == (OFI_MR_BASIC | OFI_MR_SCALABLE))
+			info->domain_attr->mr_mode = OFI_MR_SCALABLE;
 
 		/*
 		 * Avoid automatically adding secondary caps that may negatively

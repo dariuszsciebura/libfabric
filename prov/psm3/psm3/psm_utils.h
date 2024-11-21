@@ -466,8 +466,6 @@ uint32_t psm3_crc(unsigned char *buf, int len);
  * CPUID return values
  */
 #define CPUID_FAMILY_XEON       0x00000600
-#define CPUID_MODEL_PHI_GEN2    87
-#define CPUID_MODEL_PHI_GEN2M   133
 /*
  * cpuid function 0, returns "GeniuneIntel" in EBX,ECX,EDX
  * due to Little Endian and Hex it is not so obvious
@@ -528,7 +526,7 @@ void psm3_parse_multi_ep();
  *		pri_reg_mr - priority register MR failure (ENOMEM)
  *		gdrmmap - GPU gdrcopy pin and mmap failure
  */
-extern unsigned psm3_faultinj_enabled; /* use macro to test */
+extern int psm3_faultinj_enabled; /* use macro to test */
 extern int psm3_faultinj_verbose; /* use IS_FAULT macro to test */
 extern int psm3_faultinj_sec_rail;/* faults only on secondary rails or EPs */
 

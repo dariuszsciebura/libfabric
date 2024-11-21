@@ -54,7 +54,7 @@ void cxip_mr_domain_init(struct cxip_mr_domain *mr_domain)
  */
 static void cxip_ep_mr_insert(struct cxip_ep_obj *ep_obj, struct cxip_mr *mr)
 {
-	dlist_insert_tail(&mr->ep_entry, &ep_obj->mr_list);
+	dlist_insert_tail(&mr->ep_entry, &ep_obj->ctrl.mr_list);
 }
 
 /*
@@ -176,12 +176,12 @@ static int cxip_mr_enable_std(struct cxip_mr *mr)
 	if (!mr->count_events)
 		le_flags |= C_LE_EVENT_SUCCESS_DISABLE;
 
-	ret = cxip_pte_append(ep_obj->ctrl_pte,
+	ret = cxip_pte_append(ep_obj->ctrl.pte,
 			      mr->len ? CXI_VA_TO_IOVA(mr->md->md, mr->buf) : 0,
 			      mr->len, mr->len ? mr->md->md->lac : 0,
 			      C_PTL_LIST_PRIORITY, mr->req.req_id,
 			      key.key, 0, CXI_MATCH_ID_ANY,
-			      0, le_flags, mr->cntr, ep_obj->ctrl_tgq, true);
+			      0, le_flags, mr->cntr, ep_obj->ctrl.tgq, true);
 	if (ret != FI_SUCCESS) {
 		CXIP_WARN("Failed to write Append command: %d\n", ret);
 		return ret;
@@ -198,6 +198,29 @@ static int cxip_mr_enable_std(struct cxip_mr *mr)
 	return FI_SUCCESS;
 }
 
+/* If MR event counts are recorded then we can check event counts to determine
+ * if invalidate can be skipped.
+ */
+static bool cxip_mr_disable_check_count_events(struct cxip_mr *mr,
+					       uint64_t timeout)
+{
+	struct cxip_ep_obj *ep_obj = mr->ep->ep_obj;
+	uint64_t end = ofi_gettime_ns() + timeout;
+
+	while (true) {
+
+		if (ofi_atomic_get32(&mr->match_events) ==
+		    ofi_atomic_get32(&mr->access_events))
+			return true;
+
+		if (ofi_gettime_ns() >= end)
+			return false;
+
+		sched_yield();
+		cxip_ep_tgt_ctrl_progress_locked(ep_obj);
+	}
+}
+
 /*
  * cxip_mr_disable_std() - Free HW resources from the standard MR.
  *
@@ -207,35 +230,45 @@ static int cxip_mr_disable_std(struct cxip_mr *mr)
 {
 	int ret;
 	struct cxip_ep_obj *ep_obj = mr->ep->ep_obj;
+	bool count_events_disabled;
 
 	/* TODO: Handle -FI_EAGAIN. */
-	ret = cxip_pte_unlink(ep_obj->ctrl_pte, C_PTL_LIST_PRIORITY,
-			      mr->req.req_id, ep_obj->ctrl_tgq);
-	assert(ret == FI_SUCCESS);
+	ret = cxip_pte_unlink(ep_obj->ctrl.pte, C_PTL_LIST_PRIORITY,
+			      mr->req.req_id, ep_obj->ctrl.tgq);
+	if (ret != FI_SUCCESS)
+		CXIP_FATAL("Unable to queue unlink command: %d\n", ret);
 
 	do {
 		sched_yield();
 		cxip_ep_tgt_ctrl_progress_locked(ep_obj);
 	} while (mr->mr_state != CXIP_MR_UNLINKED);
 
-	/* If MR event counts are recorded then we can check event counts
-	 * to determine if invalidate can be skipped.
-	 */
-	if (!mr->count_events || ofi_atomic_get32(&mr->match_events) !=
-	    ofi_atomic_get32(&mr->access_events)) {
-		/* TODO: Temporary debug helper for DAOS to track if
-		 * Match events detect a need to flush.
-		 */
-		if (mr->count_events)
-			CXIP_WARN("Match events required pte LE invalidate\n");
+	if (mr->count_events) {
+		count_events_disabled = cxip_mr_disable_check_count_events(mr, cxip_env.mr_cache_events_disable_poll_nsecs);
+		if (count_events_disabled)
+			goto disabled_success;
 
-		ret = cxil_invalidate_pte_le(ep_obj->ctrl_pte->pte, mr->key,
-					     C_PTL_LIST_PRIORITY);
-		if (ret)
-			CXIP_WARN("MR %p key 0x%016lX invalidate failed %d\n",
-				  mr, mr->key, ret);
+		CXIP_WARN("Match events required pte LE invalidate: match_events=%u access_events=%u\n",
+			  ofi_atomic_get32(&mr->match_events),
+			  ofi_atomic_get32(&mr->access_events));
 	}
 
+	ret = cxil_invalidate_pte_le(ep_obj->ctrl.pte->pte, mr->key,
+				     C_PTL_LIST_PRIORITY);
+	if (ret)
+		CXIP_FATAL("MR %p key 0x%016lX invalidate failed %d\n", mr,
+			   mr->key, ret);
+
+	/* For LE invalidate and MR events, need to flush event queues until
+	 * access equals match.
+	 */
+	if (mr->count_events) {
+		count_events_disabled = cxip_mr_disable_check_count_events(mr, cxip_env.mr_cache_events_disable_le_poll_nsecs);
+		if (!count_events_disabled)
+			CXIP_FATAL("Failed LE MR invalidation\n");
+	}
+
+disabled_success:
 	mr->enabled = false;
 
 	CXIP_DBG("Standard MR disabled: %p (key: 0x%016lX)\n", mr, mr->key);
@@ -284,7 +317,7 @@ static int cxip_mr_enable_opt(struct cxip_mr *mr)
 
 	mr->req.cb = cxip_mr_cb;
 
-	ret = cxip_pte_alloc_nomap(ep_obj->ptable, ep_obj->ctrl_tgt_evtq,
+	ret = cxip_pte_alloc_nomap(ep_obj->ptable, ep_obj->ctrl.tgt_evtq,
 				   &opts, cxip_mr_opt_pte_cb, mr, &mr->pte);
 	if (ret != FI_SUCCESS) {
 		CXIP_WARN("Failed to allocate PTE: %d\n", ret);
@@ -307,7 +340,7 @@ static int cxip_mr_enable_opt(struct cxip_mr *mr)
 		goto err_pte_free;
 	}
 
-	ret = cxip_pte_set_state(mr->pte, ep_obj->ctrl_tgq, C_PTLTE_ENABLED, 0);
+	ret = cxip_pte_set_state(mr->pte, ep_obj->ctrl.tgq, C_PTLTE_ENABLED, 0);
 	if (ret != FI_SUCCESS) {
 		/* This is a bug, we have exclusive access to this CMDQ. */
 		CXIP_WARN("Failed to enqueue command: %d\n", ret);
@@ -339,7 +372,7 @@ static int cxip_mr_enable_opt(struct cxip_mr *mr)
 			      mr->len, mr->len ? mr->md->md->lac : 0,
 			      C_PTL_LIST_PRIORITY, mr->req.req_id,
 			      0, ib, CXI_MATCH_ID_ANY,
-			      0, le_flags, mr->cntr, ep_obj->ctrl_tgq, true);
+			      0, le_flags, mr->cntr, ep_obj->ctrl.tgq, true);
 	if (ret != FI_SUCCESS) {
 		CXIP_WARN("Failed to write Append command: %d\n", ret);
 		goto err_pte_free;
@@ -373,7 +406,7 @@ static int cxip_mr_disable_opt(struct cxip_mr *mr)
 	struct cxip_ep_obj *ep_obj = mr->ep->ep_obj;
 
 	ret = cxip_pte_unlink(mr->pte, C_PTL_LIST_PRIORITY,
-			      mr->req.req_id, ep_obj->ctrl_tgq);
+			      mr->req.req_id, ep_obj->ctrl.tgq);
 	if (ret) {
 		CXIP_WARN("Failed to enqueue Unlink: %d\n", ret);
 		goto cleanup;
@@ -443,7 +476,7 @@ static int cxip_mr_prov_cache_enable_opt(struct cxip_mr *mr)
 	uint32_t le_flags;
 	uint64_t ib = 0;
 
-	mr_cache = &ep_obj->opt_mr_cache[lac];
+	mr_cache = &ep_obj->ctrl.opt_mr_cache[lac];
 	ofi_atomic_inc32(&mr_cache->ref);
 
 	if (mr_cache->ctrl_req)
@@ -478,7 +511,7 @@ static int cxip_mr_prov_cache_enable_opt(struct cxip_mr *mr)
 	mr_cache->ctrl_req->mr.mr->optimized = true;
 	mr_cache->ctrl_req->mr.mr->mr_state = CXIP_MR_DISABLED;
 
-	ret = cxip_pte_alloc_nomap(ep_obj->ptable, ep_obj->ctrl_tgt_evtq,
+	ret = cxip_pte_alloc_nomap(ep_obj->ptable, ep_obj->ctrl.tgt_evtq,
 				   &opts, cxip_mr_opt_pte_cb,
 				   _mr, &_mr->pte);
 	if (ret != FI_SUCCESS) {
@@ -500,7 +533,7 @@ static int cxip_mr_prov_cache_enable_opt(struct cxip_mr *mr)
 		goto err_pte_free;
 	}
 
-	ret = cxip_pte_set_state(_mr->pte, ep_obj->ctrl_tgq,
+	ret = cxip_pte_set_state(_mr->pte, ep_obj->ctrl.tgq,
 				 C_PTLTE_ENABLED, 0);
 	if (ret != FI_SUCCESS) {
 		/* This is a bug, we have exclusive access to this CMDQ. */
@@ -526,7 +559,7 @@ static int cxip_mr_prov_cache_enable_opt(struct cxip_mr *mr)
 			      C_PTL_LIST_PRIORITY,
 			      mr_cache->ctrl_req->req_id,
 			      0, ib, CXI_MATCH_ID_ANY,
-			      0, le_flags, NULL, ep_obj->ctrl_tgq, true);
+			      0, le_flags, NULL, ep_obj->ctrl.tgq, true);
 	if (ret != FI_SUCCESS) {
 		CXIP_WARN("Failed to write Append command: %d\n", ret);
 		goto err_pte_free;
@@ -576,11 +609,11 @@ static int cxip_mr_prov_cache_disable_opt(struct cxip_mr *mr)
 	CXIP_DBG("Disable optimized cached MR: %p (key: 0x%016lX)\n",
 		 mr, mr->key);
 
-	if (ofi_atomic_get32(&ep_obj->opt_mr_cache[lac].ref) <= 0) {
+	if (ofi_atomic_get32(&ep_obj->ctrl.opt_mr_cache[lac].ref) <= 0) {
 		CXIP_WARN("Cached optimized MR reference underflow\n");
 		return -FI_EINVAL;
 	}
-	ofi_atomic_dec32(&ep_obj->opt_mr_cache[lac].ref);
+	ofi_atomic_dec32(&ep_obj->ctrl.opt_mr_cache[lac].ref);
 	mr->enabled = false;
 
 	return FI_SUCCESS;
@@ -603,7 +636,7 @@ static int cxip_mr_prov_cache_enable_std(struct cxip_mr *mr)
 	uint32_t le_flags;
 
 	/* TODO: Handle enabling for each bound endpoint */
-	mr_cache = &ep_obj->std_mr_cache[lac];
+	mr_cache = &ep_obj->ctrl.std_mr_cache[lac];
 	ofi_atomic_inc32(&mr_cache->ref);
 
 	if (mr_cache->ctrl_req)
@@ -646,11 +679,11 @@ static int cxip_mr_prov_cache_enable_std(struct cxip_mr *mr)
 	le_flags = C_LE_EVENT_SUCCESS_DISABLE | C_LE_UNRESTRICTED_BODY_RO |
 		   C_LE_OP_PUT | C_LE_OP_GET;
 
-	ret = cxip_pte_append(ep_obj->ctrl_pte, 0, -1ULL,
+	ret = cxip_pte_append(ep_obj->ctrl.pte, 0, -1ULL,
 			      mb.mr_lac, C_PTL_LIST_PRIORITY,
 			      mr_cache->ctrl_req->req_id,
 			      mb.raw, ib.raw, CXI_MATCH_ID_ANY,
-			      0, le_flags, NULL, ep_obj->ctrl_tgq, true);
+			      0, le_flags, NULL, ep_obj->ctrl.tgq, true);
 
 	if (ret != FI_SUCCESS) {
 		CXIP_WARN("Failed to write Append command: %d\n", ret);
@@ -698,11 +731,11 @@ static int cxip_mr_prov_cache_disable_std(struct cxip_mr *mr)
 
 	CXIP_DBG("Disable standard cached MR: %p (key: 0x%016lX)\n",
 		 mr, mr->key);
-	if (ofi_atomic_get32(&ep_obj->std_mr_cache[lac].ref) <= 0) {
+	if (ofi_atomic_get32(&ep_obj->ctrl.std_mr_cache[lac].ref) <= 0) {
 		CXIP_WARN("Cached standard MR reference underflow\n");
 		return -FI_EINVAL;
 	}
-	ofi_atomic_dec32(&ep_obj->std_mr_cache[lac].ref);
+	ofi_atomic_dec32(&ep_obj->ctrl.std_mr_cache[lac].ref);
 	mr->enabled = false;
 
 	return FI_SUCCESS;
@@ -725,6 +758,14 @@ static void cxip_mr_domain_remove(struct cxip_mr *mr)
 	ofi_spin_unlock(&mr->domain->mr_domain.lock);
 }
 
+static bool cxip_is_valid_mr_key(uint64_t key)
+{
+	if (key & ~CXIP_MR_KEY_MASK)
+		return false;
+
+	return true;
+}
+
 /*
  * cxip_mr_domain_insert() - Validate uniqueness and insert
  * client key in the domain hash table.
@@ -744,7 +785,7 @@ static int cxip_mr_domain_insert(struct cxip_mr *mr)
 
 	mr->key = mr->attr.requested_key;
 
-	if (!cxip_generic_is_valid_mr_key(mr->key))
+	if (!cxip_is_valid_mr_key(mr->key))
 		return -FI_EKEYREJECTED;
 
 	bucket = fasthash64(&mr->key, sizeof(mr->key), 0) %
@@ -816,14 +857,6 @@ static int cxip_prov_cache_init_mr_key(struct cxip_mr *mr,
 		 key.raw, key.lac, (uint64_t)key.lac_off);
 
 	return FI_SUCCESS;
-}
-
-static bool cxip_is_valid_mr_key(uint64_t key)
-{
-	if (key & ~CXIP_MR_KEY_MASK)
-		return false;
-
-	return true;
 }
 
 static bool cxip_is_valid_prov_mr_key(uint64_t key)
@@ -994,15 +1027,15 @@ void cxip_ctrl_mr_cache_flush(struct cxip_ep_obj *ep_obj)
 
 	/* Flush standard MR resources hardware resources not in use */
 	for (lac = 0; lac < CXIP_NUM_CACHED_KEY_LE; lac++) {
-		mr_cache = &ep_obj->std_mr_cache[lac];
+		mr_cache = &ep_obj->ctrl.std_mr_cache[lac];
 
 		if (!mr_cache->ctrl_req ||
 		    ofi_atomic_get32(&mr_cache->ref))
 			continue;
 
-		ret = cxip_pte_unlink(ep_obj->ctrl_pte, C_PTL_LIST_PRIORITY,
+		ret = cxip_pte_unlink(ep_obj->ctrl.pte, C_PTL_LIST_PRIORITY,
 				      mr_cache->ctrl_req->req_id,
-				      ep_obj->ctrl_tgq);
+				      ep_obj->ctrl.tgq);
 		assert(ret == FI_SUCCESS);
 
 		do {
@@ -1011,7 +1044,7 @@ void cxip_ctrl_mr_cache_flush(struct cxip_ep_obj *ep_obj)
 		} while (mr_cache->ctrl_req->mr.mr->mr_state !=
 			 CXIP_MR_UNLINKED);
 
-		ret = cxil_invalidate_pte_le(ep_obj->ctrl_pte->pte,
+		ret = cxil_invalidate_pte_le(ep_obj->ctrl.pte->pte,
 					     mr_cache->ctrl_req->req_id,
 					     C_PTL_LIST_PRIORITY);
 		if (ret)
@@ -1026,7 +1059,7 @@ void cxip_ctrl_mr_cache_flush(struct cxip_ep_obj *ep_obj)
 
 	/* Flush optimized MR resources hardware resources not in use */
 	for (lac = 0; lac < CXIP_NUM_CACHED_KEY_LE; lac++) {
-		mr_cache = &ep_obj->opt_mr_cache[lac];
+		mr_cache = &ep_obj->ctrl.opt_mr_cache[lac];
 
 		if (!mr_cache->ctrl_req ||
 		    ofi_atomic_get32(&mr_cache->ref))
@@ -1035,7 +1068,7 @@ void cxip_ctrl_mr_cache_flush(struct cxip_ep_obj *ep_obj)
 		ret = cxip_pte_unlink(mr_cache->ctrl_req->mr.mr->pte,
 				      C_PTL_LIST_PRIORITY,
 				      mr_cache->ctrl_req->req_id,
-				      ep_obj->ctrl_tgq);
+				      ep_obj->ctrl.tgq);
 		if (ret) {
 			CXIP_WARN("Failed to enqueue Unlink: %d\n", ret);
 			goto cleanup;
@@ -1250,6 +1283,15 @@ static int cxip_mr_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
 			break;
 		}
 
+		/* Zero length MRs do not have MD. */
+		if (mr->md &&
+		    ep->ep_obj->require_dev_reg_copy[mr->md->info.iface] &&
+		    !mr->md->handle_valid) {
+			CXIP_WARN("Cannot bind to endpoint without required dev reg support\n");
+			ret = -FI_EOPNOTSUPP;
+			break;
+		}
+
 		mr->ep = ep;
 		ofi_atomic_inc32(&ep->ep_obj->ref);
 		break;
@@ -1406,6 +1448,10 @@ static int cxip_regattr(struct fid *fid, const struct fi_mr_attr *attr,
 		_mr->mr_fid.key = _mr->key;
 
 	if (_mr->len) {
+		/* Do not check whether cuda_api_permitted is set at this point,
+		 * because the mr is not bound to an endpoint.  Check instead in
+		 * cxip_mr_bind().
+		 */
 		ret = cxip_map(_mr->domain, (void *)_mr->buf, _mr->len, 0,
 			       &_mr->md);
 		if (ret) {

@@ -131,22 +131,6 @@ A more comprehensive test package is available via the fabtests package.
 
 ## Providers
 
-### gni
-
-***
-
-The `gni` provider runs on Cray XC (TM) systems utilizing the user-space
-Generic Network Interface (`uGNI`), which provides low-level access to
-the Aries interconnect.  The Aries interconnect is designed for
-low-latency one-sided messaging and also includes direct hardware
-support for common atomic operations and optimized collectives.
-
-See the `fi_gni(7)` man page for more details.
-
-#### Dependencies
-
-- The `gni` provider requires `gcc` version 4.9 or higher.
-
 ### opx
 
 ***
@@ -241,6 +225,38 @@ libfabric features over any hardware.
 
 See the `fi_udp(7)` man page for more details.
 
+### usnic
+
+***
+
+The `usnic` provider is designed to run over the Cisco VIC (virtualized NIC)
+hardware on Cisco UCS servers. It utilizes the Cisco usnic (userspace NIC)
+capabilities of the VIC to enable ultra low latency and other offload
+capabilities on Ethernet networks.
+
+See the `fi_usnic(7)` man page for more details.
+
+#### Dependencies
+
+- The `usnic` provider depends on library files from either `libnl` version 1
+  (sometimes known as `libnl` or `libnl1`) or version 3 (sometimes known as
+  `libnl3`). If you are compiling libfabric from source and want to enable
+  usNIC support, you will also need the matching `libnl` header files (e.g.,
+  if you are building with `libnl` version 3, you need both the header and
+  library files from version 3).
+
+#### Configure options
+
+```
+--with-libnl=<directory>
+```
+
+If specified, look for libnl support. If it is not found, the `usnic`
+provider will not be built. If `<directory>` is specified, then check in the
+directory and check for `libnl` version 3. If version 3 is not found, then
+check for version 1. If no `<directory>` argument is specified, then this
+option is redundant with `--with-usnic`.
+
 ### verbs
 
 ***
@@ -250,6 +266,9 @@ hardware (Infiniband, iWarp, and RoCE). It uses the Linux Verbs API for network
 transport and translates OFI calls to appropriate verbs API calls.
 It uses librdmacm for communication management and libibverbs for other control
 and data transfer operations.
+
+The verbs provider can also be built on Windows using the Microsoft Network
+Direct SPI for network transport.
 
 See the `fi_verbs(7)` man page for more details.
 
@@ -261,29 +280,8 @@ See the `fi_verbs(7)` man page for more details.
   If the libraries and header files are not in default paths, specify them in CFLAGS,
   LDFLAGS and LD_LIBRARY_PATH environment variables.
 
-### Network Direct
-
-***
-
-The Network Direct provider enables applications using OFI to be run over
-any verbs hardware (Infiniband, iWarp, and RoCE). It uses the Microsoft Network
-Direct SPI for network transport and provides a translation of OFI calls to
-appropriate Network Direct API calls.
-The Network Direct providers enables OFI-based applications to utilize
-zero-copy data transfers between applications, kernel-bypass I/O generation and
-one-sided data transfer operations on Microsoft Windows OS.
-An application can use OFI with the Network Direct provider enabled on
-Windows OS to expose the capabilities of the networking devices if the hardware
-vendors of the devices implemented the Network Direct service provider interface
-(SPI) for their hardware.
-
-See the `fi_netdir(7)` man page for more details.
-
-#### Dependencies
-
-- The Network Direct provider requires Network Direct SPI. If you are compiling
-  libfabric from source and want to enable Network Direct support, you will also
-  need the matching header files for the Network Direct SPI.
+- Windows built requires Network Direct SPI. If you are compiling libfabric from
+  source, you will also need the matching header files for the Network Direct SPI.
   If the libraries and header files are not in default paths, specify them in the
   configuration properties of the VS project.
 
@@ -346,3 +344,26 @@ It is possible to compile and link libfabric with windows applications.
   - choose C/C++ > General and add `<libfabricroot>\include` to "Additional include Directories"
   - choose Linker > Input and add `<libfabricroot>\x64\<yourconfigchoice>\libfabric.lib` to "Additional Dependencies"
   - depending on what you are building you may also need to copy `libfabric.dll` into the target folder of your own project.
+
+### cxi
+
+The CXI provider enables libfabric on Cray's Slingshot network. Slingshot is
+comprised of the Rosetta switch and Cassini NIC. Slingshot is an
+Ethernet-compliant network. However, The provider takes advantage of proprietary
+extensions to support HPC applications.
+
+The CXI provider supports reliable, connection-less endpoint semantics. It
+supports two-sided messaging interfaces with message matching offloaded by the
+Cassini NIC. It also supports one-sided RMA and AMO interfaces, light-weight
+counting events, triggered operations (via the deferred work API), and
+fabric-accelerated small reductions.
+
+See the `fi_cxi(7)` man page for more details.
+
+#### Dependencies
+
+- The CXI Provider requires Cassini's optimized HPC protocol which is only
+  supported in combination with the Rosetta switch.
+
+- The provider uses the libCXI library for control operations and a set of
+  Cassini-specific header files to enable direct hardware access in the data path.

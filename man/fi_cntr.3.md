@@ -106,7 +106,7 @@ behavior of the counter are defined by `struct fi_cntr_attr`.
 struct fi_cntr_attr {
 	enum fi_cntr_events  events;    /* type of events to count */
 	enum fi_wait_obj     wait_obj;  /* requested wait object */
-	struct fid_wait     *wait_set;  /* optional wait set */
+	struct fid_wait     *wait_set;  /* optional wait set, deprecated */
 	uint64_t             flags;     /* operation flags */
 };
 ```
@@ -123,6 +123,26 @@ struct fi_cntr_attr {
   on all successful completions, separately from whether the operation
   generates an entry in an event queue.
 
+- *FI_CNTR_EVENTS_BYTES*
+: The counter is incremented by the number of user bytes,
+  excluding any CQ data, transferred in a transport message
+  upon reaching the specified completion semantic.
+  For initiator side counters, the count reflects the size of the
+  requested transfer and is updated after the message reaches
+  the desired completion level (FI_INJECT_COMPLETE,
+  FI_TRANSMIT_COMPLETE, etc.).  For send and write operations,
+  the count reflects the number of bytes transferred to the peer.
+  For read operations, the count reflects the number of bytes
+  returned in a read response.  Operations which may both
+  write and read data, such as atomics, behave as read operations
+  at the initiator, but writes at the target.  For target side
+  counters, the count reflects the size of received user data
+  and is incremented subject to target side completion semantics.
+  In most cases, this indicates FI_DELIVERY_COMPLETE, but may
+  differ when accessing device memory (HMEM).  On error, the 
+  tranfer size is not applied to the error field, that field is 
+  increment by 1.  The FI_COLLECTIVE transfer type is not supported.
+
 *wait_obj*
 : Counters may be associated with a specific wait object.  Wait
   objects allow applications to block until the wait object is
@@ -131,7 +151,7 @@ struct fi_cntr_attr {
   object associated with a counter, in order to use it in other system
   calls.  The following values may be used to specify the type of wait
   object associated with a counter: FI_WAIT_NONE, FI_WAIT_UNSPEC,
-  FI_WAIT_SET, FI_WAIT_FD, FI_WAIT_MUTEX_COND, and FI_WAIT_YIELD. 
+  FI_WAIT_SET, FI_WAIT_FD, FI_WAIT_MUTEX_COND (deprecated), and FI_WAIT_YIELD. 
   The default is FI_WAIT_NONE.
 
 - *FI_WAIT_NONE*
@@ -146,7 +166,7 @@ struct fi_cntr_attr {
   Applications that select FI_WAIT_UNSPEC are not guaranteed to
   retrieve the underlying wait object.
 
-- *FI_WAIT_SET*
+- *FI_WAIT_SET* (deprecated)
 : Indicates that the event counter should use a wait set object to
   wait for events.  If specified, the wait_set field must reference an
   existing wait set object.
@@ -157,7 +177,7 @@ struct fi_cntr_attr {
   poll, and epoll routines.  However, a provider may signal an FD wait
   object by marking it as readable, writable, or with an error.
 
-- *FI_WAIT_MUTEX_COND*
+- *FI_WAIT_MUTEX_COND* (deprecated)
 : Specifies that the counter should use a pthread mutex and cond
   variable as a wait object.
 
@@ -165,7 +185,7 @@ struct fi_cntr_attr {
 : Indicates that the counter will wait without a wait object but instead
   yield on every wait. Allows usage of fi_cntr_wait through a spin.
 
-*wait_set*
+*wait_set* (deprecated)
 : If wait_obj is FI_WAIT_SET, this field references a wait object to
   which the event counter should attach.  When an event is added to
   the event counter, the corresponding wait set will be signaled if

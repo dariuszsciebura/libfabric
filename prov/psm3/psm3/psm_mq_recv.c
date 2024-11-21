@@ -199,11 +199,13 @@ psm3_mq_req_copy(psm2_mq_req_t req,
 	}
 	if (msgptr != buf) {
 #if defined(PSM_CUDA) || defined(PSM_ONEAPI)
+		// for loopback HAL, invalid to call psm3_mq_get_window_rv()
+		// however, for loopback HAL, gdr copy is disabled
 		if (use_gdrcopy)
 			psm3_mq_req_gpu_copy((uint64_t)req->req_data.buf,
 					     req->req_data.recv_msglen,
 					     (uint64_t)msgptr, msglen_this,
-					     req->mq->hfi_base_window_rv, buf,
+					     psm3_mq_get_window_rv(req), buf,
 					     ep);
 		else
 #endif
@@ -461,7 +463,7 @@ psm3_mq_handle_rts(psm2_mq_t mq, psm2_epaddr_t src, uint32_t *_tag,
 		/* We don't know recv_msglen yet but we set it here for
 		 * mq_iprobe */
 		req->req_data.send_msglen = req->req_data.recv_msglen = send_msglen;
-		PSM2_LOG_EPM_COND(req->req_data.send_msglen > mq->hfi_thresh_rv,
+		PSM2_LOG_EPM_COND(req->req_data.send_msglen > mq->rndv_nic_thresh,
 				 OPCODE_LONG_RTS,PSM2_LOG_RX,src->epid,mq->ep->epid,
 				    "req->rts_reqidx_peer: %d",req->rts_reqidx_peer);
 		req->state = MQ_STATE_UNEXP_RV;

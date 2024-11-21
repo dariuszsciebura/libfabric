@@ -343,6 +343,32 @@ void cxit_create_local_cntrs(void)
 	cr_assert(ret == FI_SUCCESS, "fi_cntr_open (write)");
 }
 
+void cxit_create_local_byte_cntrs(void)
+{
+	struct fi_cntr_attr attr = {
+		.events = FI_CXI_CNTR_EVENTS_BYTES,
+		.wait_obj = FI_WAIT_YIELD,
+	};
+	int ret;
+
+	ret = fi_cntr_open(cxit_domain, &attr, &cxit_send_cntr,
+			   NULL);
+	cr_assert(ret == FI_SUCCESS, "fi_cntr_open (send)");
+
+	ret = fi_cntr_open(cxit_domain, &attr, &cxit_recv_cntr,
+			   NULL);
+	cr_assert(ret == FI_SUCCESS, "fi_cntr_open (recv)");
+
+	/* For now have read/write still use event counting */
+	ret = fi_cntr_open(cxit_domain, NULL, &cxit_read_cntr,
+			   NULL);
+	cr_assert(ret == FI_SUCCESS, "fi_cntr_open (read)");
+
+	ret = fi_cntr_open(cxit_domain, NULL, &cxit_write_cntr,
+			   NULL);
+	cr_assert(ret == FI_SUCCESS, "fi_cntr_open (write)");
+}
+
 void cxit_create_cntrs(void)
 {
 	cxit_create_local_cntrs();
@@ -458,7 +484,7 @@ void cxit_init(void)
 	fi_freeinfo(hints);
 }
 
-struct fi_info *cxit_allocinfo(void)
+struct fi_info *cxit_allocinfo_common(uint32_t proto)
 {
 	struct fi_info *info;
 	char *odp_env;
@@ -482,11 +508,25 @@ struct fi_info *cxit_allocinfo(void)
 	}
 
 	/* If remote ODP is enabled then test with ODP */
-	odp_env = getenv("CXIP_TEST_ODP");
+	odp_env = getenv("FI_CXI_ODP");
 	if (odp_env && strtol(odp_env, NULL, 10))
 		info->domain_attr->mr_mode &= ~FI_MR_ALLOCATED;
 
+	/* If a EP protocol was specified indicate to use it */
+	if (proto)
+		info->ep_attr->protocol = proto;
+
 	return info;
+}
+
+struct fi_info *cxit_allocinfo(void)
+{
+	return cxit_allocinfo_common(0);
+}
+
+struct fi_info *cxit_allocinfo_proto(uint32_t proto)
+{
+	return cxit_allocinfo_common(proto);
 }
 
 void cxit_setup_getinfo(void)
@@ -495,6 +535,14 @@ void cxit_setup_getinfo(void)
 
 	if (!cxit_fi_hints)
 		cxit_fi_hints = cxit_allocinfo();
+}
+
+void cxit_setup_getinfo_proto(uint32_t proto)
+{
+	cxit_init();
+
+	if (!cxit_fi_hints)
+		cxit_fi_hints = cxit_allocinfo_proto(proto);
 }
 
 void cxit_teardown_getinfo(void)
@@ -537,6 +585,47 @@ void cxit_teardown_ep(void)
 {
 	cxit_destroy_domain();
 	cxit_teardown_domain();
+}
+
+void cxit_setup_enabled_rnr_msg_ep(void)
+{
+	int ret;
+	size_t addrlen = sizeof(cxit_ep_addr);
+
+	cxit_setup_getinfo();
+
+	cxit_tx_cq_attr.format = FI_CQ_FORMAT_TAGGED;
+	cxit_av_attr.type = FI_AV_TABLE;
+
+	cxit_fi_hints->domain_attr->data_progress = FI_PROGRESS_MANUAL;
+	cxit_fi_hints->domain_attr->data_progress = FI_PROGRESS_MANUAL;
+
+	/* Indicate we want to use the CS protocol */
+	cxit_fi_hints->ep_attr->protocol = FI_PROTO_CXI_RNR;
+
+	cxit_setup_ep();
+
+	/* Set up RMA objects */
+	cxit_create_ep();
+	cxit_create_eq();
+	cxit_bind_eq();
+	cxit_create_cqs();
+	cxit_bind_cqs();
+
+	/* No FI_RMA_EVENT, don't create/bind remote counters */
+	cxit_create_local_cntrs();
+	cxit_bind_cntrs();
+
+	cxit_create_av();
+	cxit_bind_av();
+
+	ret = fi_enable(cxit_ep);
+	cr_assert(ret == FI_SUCCESS, "ret is: %d\n", ret);
+
+	/* Find assigned Endpoint address. Address is assigned during enable. */
+	ret = fi_getname(&cxit_ep->fid, &cxit_ep_addr, &addrlen);
+	cr_assert(ret == FI_SUCCESS, "ret is %d\n", ret);
+	cr_assert(addrlen == sizeof(cxit_ep_addr));
 }
 
 void cxit_setup_enabled_ep_disable_fi_rma_event(void)
@@ -746,6 +835,23 @@ void cxit_setup_rma_mr_events(void)
 	fi_control(&cxit_domain->fid, FI_OPT_CXI_SET_PROV_KEY_CACHE, &disable);
 }
 
+void cxit_setup_rnr_msg_ep(void)
+{
+	int ret;
+	struct cxip_addr fake_addr = {.nic = 0xad, .pid = 0xbc};
+
+	cxit_setup_enabled_rnr_msg_ep();
+
+	/* Insert local address into AV to prepare to send to self */
+	ret = fi_av_insert(cxit_av, (void *)&fake_addr, 1, NULL, 0, NULL);
+	cr_assert(ret == 1);
+
+	/* Insert local address into AV to prepare to send to self */
+	ret = fi_av_insert(cxit_av, (void *)&cxit_ep_addr, 1, &cxit_ep_fi_addr,
+			  0, NULL);
+	cr_assert(ret == 1);
+}
+
 void cxit_bind_cqs_hybrid_mr_desc(void)
 {
 	int ret;
@@ -853,13 +959,143 @@ void cxit_setup_rma_hybrid_mr_desc(void)
 	cr_assert(ret == 1);
 }
 
+void cxit_setup_enabled_rnr_ep_hybrid_mr_desc(void)
+{
+	int ret;
+	size_t addrlen = sizeof(cxit_ep_addr);
+
+	cxit_setup_getinfo();
+
+	cxit_tx_cq_attr.format = FI_CQ_FORMAT_TAGGED;
+	cxit_av_attr.type = FI_AV_TABLE;
+
+	cxit_fi_hints->domain_attr->data_progress = FI_PROGRESS_MANUAL;
+	cxit_fi_hints->domain_attr->data_progress = FI_PROGRESS_MANUAL;
+
+	/* Indicate we want to use the CS protocol */
+	cxit_fi_hints->ep_attr->protocol = FI_PROTO_CXI_RNR;
+	cxit_fi_hints->domain_attr->mr_mode = FI_MR_PROV_KEY | FI_MR_ALLOCATED |
+					      FI_MR_ENDPOINT;
+
+	cxit_setup_ep_hybrid_mr_desc();
+
+	cxit_fi->caps &= ~FI_RMA_EVENT;
+	cxit_fi->domain_attr->caps &= ~FI_RMA_EVENT;
+	cxit_fi->tx_attr->caps &= ~FI_RMA_EVENT;
+	cxit_fi->rx_attr->caps &= ~FI_RMA_EVENT;
+
+	/* Set up RMA objects */
+	cxit_create_ep();
+	cxit_create_eq();
+	cxit_bind_eq();
+	cxit_create_cqs();
+	cxit_bind_cqs_hybrid_mr_desc();
+
+	/* No FI_RMA_EVENT, don't create/bind remote counters */
+	cxit_create_local_cntrs();
+	cxit_bind_cntrs();
+
+	cxit_create_av();
+	cxit_bind_av();
+
+	ret = fi_enable(cxit_ep);
+	cr_assert(ret == FI_SUCCESS, "ret is: %d\n", ret);
+
+	/* Find assigned Endpoint address. Address is assigned during enable. */
+	ret = fi_getname(&cxit_ep->fid, &cxit_ep_addr, &addrlen);
+	cr_assert(ret == FI_SUCCESS, "ret is %d\n", ret);
+	cr_assert(addrlen == sizeof(cxit_ep_addr));
+}
+
+void cxit_setup_enabled_rnr_ep_hybrid_mr_desc_byte_cntr(void)
+{
+	int ret;
+	size_t addrlen = sizeof(cxit_ep_addr);
+
+	cxit_setup_getinfo();
+
+	cxit_tx_cq_attr.format = FI_CQ_FORMAT_TAGGED;
+	cxit_av_attr.type = FI_AV_TABLE;
+
+	cxit_fi_hints->domain_attr->data_progress = FI_PROGRESS_MANUAL;
+	cxit_fi_hints->domain_attr->data_progress = FI_PROGRESS_MANUAL;
+
+	/* Indicate we want to use the CS protocol */
+	cxit_fi_hints->ep_attr->protocol = FI_PROTO_CXI_RNR;
+	cxit_fi_hints->domain_attr->mr_mode = FI_MR_PROV_KEY | FI_MR_ALLOCATED |
+					      FI_MR_ENDPOINT;
+
+	cxit_setup_ep_hybrid_mr_desc();
+
+	cxit_fi->caps &= ~FI_RMA_EVENT;
+	cxit_fi->domain_attr->caps &= ~FI_RMA_EVENT;
+	cxit_fi->tx_attr->caps &= ~FI_RMA_EVENT;
+	cxit_fi->rx_attr->caps &= ~FI_RMA_EVENT;
+
+	/* Set up RMA objects */
+	cxit_create_ep();
+	cxit_create_eq();
+	cxit_bind_eq();
+	cxit_create_cqs();
+	cxit_bind_cqs_hybrid_mr_desc();
+
+	/* No FI_RMA_EVENT, don't create/bind remote counters */
+	cxit_create_local_byte_cntrs();
+	cxit_bind_cntrs();
+
+	cxit_create_av();
+	cxit_bind_av();
+
+	ret = fi_enable(cxit_ep);
+	cr_assert(ret == FI_SUCCESS, "ret is: %d\n", ret);
+
+	/* Find assigned Endpoint address. Address is assigned during enable. */
+	ret = fi_getname(&cxit_ep->fid, &cxit_ep_addr, &addrlen);
+	cr_assert(ret == FI_SUCCESS, "ret is %d\n", ret);
+	cr_assert(addrlen == sizeof(cxit_ep_addr));
+}
+
+void cxit_setup_rma_rnr_hybrid_mr_desc(void)
+{
+	int ret;
+	struct cxip_addr fake_addr = {.nic = 0xad, .pid = 0xbc};
+
+	cxit_setup_enabled_rnr_ep_hybrid_mr_desc();
+
+	/* Insert local address into AV to prepare to send to self */
+	ret = fi_av_insert(cxit_av, (void *)&fake_addr, 1, NULL, 0, NULL);
+	cr_assert(ret == 1);
+
+	/* Insert local address into AV to prepare to send to self */
+	ret = fi_av_insert(cxit_av, (void *)&cxit_ep_addr, 1, &cxit_ep_fi_addr,
+			   0, NULL);
+	cr_assert(ret == 1);
+}
+
+void cxit_setup_rma_rnr_hybrid_mr_desc_byte_cntr(void)
+{
+	int ret;
+	struct cxip_addr fake_addr = {.nic = 0xad, .pid = 0xbc};
+
+	cxit_setup_enabled_rnr_ep_hybrid_mr_desc_byte_cntr();
+
+	/* Insert local address into AV to prepare to send to self */
+	ret = fi_av_insert(cxit_av, (void *)&fake_addr, 1, NULL, 0, NULL);
+	cr_assert(ret == 1);
+
+	/* Insert local address into AV to prepare to send to self */
+	ret = fi_av_insert(cxit_av, (void *)&cxit_ep_addr, 1, &cxit_ep_fi_addr,
+			   0, NULL);
+	cr_assert(ret == 1);
+}
+
 void cxit_setup_rma(void)
 {
 	int ret;
 	struct cxip_addr fake_addr = {.nic = 0xad, .pid = 0xbc};
 
-	cxip_trace_append = true;
-	cxip_trace_enable(true);
+	cxip_coll_trace_append = true;
+	cxip_coll_trace_muted = false;
 	cxit_setup_enabled_ep();
 
 	/* Insert local address into AV to prepare to send to self */

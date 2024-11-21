@@ -81,6 +81,11 @@
 #define CTRL_MSG_DISCONNECT_REQUEST_QUEUED	0x0080
 #define CTRL_MSG_DISCONNECT_REPLY_QUEUED	0x0100
 
+#define CREDITS_INC_THRESH 2048
+// we are using 31 bits psn, and int16_t for psn diff on nak detection
+// to play safe we set max credit to 16384
+#define IPS_MAX_CREDIT 16384
+
 #if defined(PSM_CUDA) || defined(PSM_ONEAPI)
 uint32_t gpudirect_rdma_send_limit;
 uint32_t gpudirect_rdma_recv_limit;
@@ -105,6 +110,59 @@ void psmi_gpu_hostbuf_alloc_func(int is_alloc, void *context, void *obj)
 	return;
 }
 #endif /* PSM_CUDA || PSM_ONEAPI */
+
+static int parse_flow_credits(const char *str,
+			size_t errstr_size, char errstr[],
+			int tvals[3])
+{
+	psmi_assert(tvals);
+	int ntup = psm3_count_tuples(str);
+	int ret = psm3_parse_str_tuples(str, ntup, tvals);
+	if (ret < 0)
+		return ret;
+        // back compatibility - when only one value specified, set max=min, step=0
+        // this also can make value check to be accurate
+	if (ntup == 1) {
+		tvals[1] = tvals[0];
+		tvals[2] = 0;
+	}
+	if (tvals[0] < 0 || tvals[1] < 0 || tvals[2] < 0) {
+		if (errstr_size)
+			snprintf(errstr, errstr_size, " Negative values not allowed");
+		return -2;
+	}
+	if (tvals[0] > IPS_MAX_CREDIT || tvals[1] > IPS_MAX_CREDIT || tvals[2] > IPS_MAX_CREDIT) {
+		if (errstr_size)
+			snprintf(errstr, errstr_size, " Max allowed is %u", IPS_MAX_CREDIT);
+		return -2;
+	}
+	if (tvals[0] == 0 || tvals[1] == 0) {
+		if (errstr_size)
+			snprintf(errstr, errstr_size, " Zero values not allowed on min, max");
+		return -2;
+	}
+	if (tvals[1] > tvals[0] && tvals[2] == 0) {
+		if (errstr_size)
+			snprintf(errstr, errstr_size, " Zero values not allowed on adjust when max > min");
+		return -2;
+	}
+	if (tvals[0] > tvals[1]) {
+		if (errstr_size)
+			snprintf(errstr, errstr_size, " min (%d) must be <= max (%d)", tvals[0], tvals[1]);
+		return -2;
+	}
+	return 0;
+}
+
+static int parse_check_flow_credits(int type,
+			const union psmi_envvar_val val, void *ptr,
+			size_t errstr_size, char errstr[])
+{
+	// parser will set tvals to result, use a copy to protect input of defaults
+	int tvals[3] = { ((int*)ptr)[0], ((int*)ptr)[1], ((int*)ptr)[2]};
+	psmi_assert(type == PSMI_ENVVAR_TYPE_STR_TUPLES);
+	return parse_flow_credits(val.e_str, errstr_size, errstr, tvals);
+}
 
 psm2_error_t
 psm3_ips_proto_init(psm2_ep_t ep, const ptl_t *ptl,
@@ -133,15 +191,57 @@ psm3_ips_proto_init(psm2_ep_t ep, const ptl_t *ptl,
 	{
 		/* Number of credits per flow */
 		union psmi_envvar_val env_flow_credits;
-		int df_flow_credits = min(PSM2_FLOW_CREDITS, num_of_send_desc);
+		int tvals[3] = {
+                	min(IPS_PROTO_FLOW_CREDITS_MIN_DEFAULT, num_of_send_desc),
+                	min(IPS_PROTO_FLOW_CREDITS_MAX_DEFAULT, num_of_send_desc),
+                	IPS_PROTO_FLOW_CREDITS_STEP_DEFAULT
+                };
+		char fcredits_def[32];
+		snprintf(fcredits_def, sizeof(fcredits_def), "%d:%d:%d", tvals[0], tvals[1], tvals[2]);
 
-		psm3_getenv("PSM3_FLOW_CREDITS",
-			    "Number of unacked packets (credits) per flow (default is 64)",
-			    PSMI_ENVVAR_LEVEL_USER, PSMI_ENVVAR_TYPE_UINT,
-			    (union psmi_envvar_val)df_flow_credits,
+		(void)psm3_getenv_range("PSM3_FLOW_CREDITS",
+			    "Number of unacked packets (credits) per flow in <min:max:adjust>",
+			    "Specified as min:max:adjust where min and max is the range of credits,\n"
+			    "and adjust is the adjustment amount for adjusting credits",
+			    PSMI_ENVVAR_LEVEL_USER, PSMI_ENVVAR_TYPE_STR_TUPLES,
+			    (union psmi_envvar_val)fcredits_def,
+			    (union psmi_envvar_val)NULL, (union psmi_envvar_val)NULL,
+			    parse_check_flow_credits, tvals,
 			    &env_flow_credits);
-		proto->flow_credits = env_flow_credits.e_uint;
+		if (parse_flow_credits(env_flow_credits.e_str, 0, NULL, tvals) < 0) {
+                	// already checked, shouldn't get parse errors nor empty strings
+                	psmi_assert(0);
+                }
+                if (tvals[0] > num_of_send_desc) {
+                	tvals[0] = num_of_send_desc;
+                }
+                if (tvals[1] > num_of_send_desc) {
+                	tvals[1] = num_of_send_desc;
+                }
+
+                // set init flow credits. Use PSM2_FLOW_CREDITS when possible
+		int df_flow_credits = min(PSM2_FLOW_CREDITS, num_of_send_desc);
+		if (df_flow_credits > tvals[0] && df_flow_credits < tvals[1]) {
+			proto->flow_credits = df_flow_credits;
+		} else {
+			proto->flow_credits = (tvals[0] + tvals[1]) / 2;
+		}
+		proto->min_credits = tvals[0];
+		proto->max_credits = tvals[1];
+		proto->credits_adjust = tvals[2];
 	}
+
+	{
+		union psmi_envvar_val env_thresh;
+		psm3_getenv_range("PSM3_CREDITS_INC_THRESH",
+			    "Threshold for increasing credits", NULL,
+			    PSMI_ENVVAR_LEVEL_HIDDEN, PSMI_ENVVAR_TYPE_UINT,
+			    (union psmi_envvar_val)CREDITS_INC_THRESH,
+			    (union psmi_envvar_val)0, (union psmi_envvar_val)UINT16_MAX,
+			    NULL, NULL, &env_thresh);
+		proto->credits_inc_thresh = env_thresh.e_uint;
+	}
+
 
 	/*
 	 * Checksum packets within PSM. Default is off.
@@ -197,7 +297,7 @@ psm3_ips_proto_init(psm2_ep_t ep, const ptl_t *ptl,
 		proto->multirail_thresh_load_balance = env_thresh_load_balance.e_uint;
 	}
 
-	/* Initialize IBTA related stuff (path record, SL2VL, CCA etc.) */
+	/* Initialize IBTA related stuff (path record, etc.) */
 	if ((err = psm3_ips_ibta_init(proto)))
 		goto fail;
 
@@ -233,9 +333,6 @@ psm3_ips_proto_init(psm2_ep_t ep, const ptl_t *ptl,
 			proto->flags |= IPS_PROTO_FLAG_COALESCE_ACKS;
 	}
 
-	/*
-	 * Initialize SDMA, otherwise, turn on all PIO.
-	 */
 	// initialize sdma after PSM3_MR_CACHE_MODE
 	proto->flags |= IPS_PROTO_FLAG_SPIO;
 
@@ -316,13 +413,12 @@ psm3_ips_proto_init(psm2_ep_t ep, const ptl_t *ptl,
 	 * If we enable tid-based expected rendezvous, the expected protocol code
 	 * handles its own rv scb buffers.  If not, we have to enable eager-based
 	 * rendezvous and we allocate scb buffers for it.
-	 * For UD PSM3_RDMA (ep->rdmamode) controls our use of RDMA for Rendezvous
-	 * For STL100 PSM3_TID controls use of EXPTID for Rendezvous
+	 * For verbs PSM3_RDMA (ep->rdmamode) controls our use of RDMA for Rendezvous
 	 */
 	protoexp_flags = proto->ep->rdmamode;	// PSM3_RDMA
 
-	// protoexp implements RDMA for UD and TID for STL100 native.  N/A to UDP
-	// when proto->protoexp is NULL, we will not attempt to use TID nor RDMA
+	// protoexp implements RDMA for verbs.  N/A to sockets
+	// when proto->protoexp is NULL, we will not attempt to use RDMA
 	{
 		(void)protoexp_flags;
 		// for UD, even when RDMA is enabled, we may fall back to LONG_DATA
@@ -452,6 +548,8 @@ psm3_ips_proto_init(psm2_ep_t ep, const ptl_t *ptl,
 		 (protoexp_flags & IPS_PROTOEXP_FLAG_ENABLED)) {
 		struct psmi_rlimit_mpool rlim = GPU_HOSTBUFFER_LIMITS;
 		uint32_t maxsz, chunksz, max_elements;
+		uint32_t pool_num_obj_max_total;
+		uint32_t small_pool_num_obj_max_total;
 
 		if ((err = psm3_parse_mpool_env(proto->mq, 1,
 						&rlim, &maxsz, &chunksz)))
@@ -459,10 +557,12 @@ psm3_ips_proto_init(psm2_ep_t ep, const ptl_t *ptl,
 
 		/* the maxsz is the amount in MB, not the number of entries,
 		 * since the element size depends on the window size */
-		max_elements = (maxsz*1024*1024) / proto->mq->hfi_base_window_rv;
+		max_elements = (maxsz*1024*1024) / psm3_mq_max_window_rv(proto->mq, 1);
 		/* mpool requires max_elements to be power of 2. round down. */
 		max_elements = 1 << (31 - __builtin_clz(max_elements));
-		proto->gpu_hostbuf_send_cfg.bufsz = proto->mq->hfi_base_window_rv;
+		/* need at least 3 buffers */
+		max_elements = max(4, max_elements);
+		proto->gpu_hostbuf_send_cfg.bufsz = psm3_mq_max_window_rv(proto->mq, 1);
 		proto->gpu_hostbuf_pool_send =
 			psm3_mpool_create_for_gpu(sizeof(struct ips_gpu_hostbuf),
 						  chunksz, max_elements, 0,
@@ -476,6 +576,8 @@ psm3_ips_proto_init(psm2_ep_t ep, const ptl_t *ptl,
 						"Couldn't allocate GPU host send buffer pool");
 			goto fail;
 		}
+		psm3_mpool_get_obj_info(proto->gpu_hostbuf_pool_send,
+					NULL, &pool_num_obj_max_total);
 
 		/* use the same number of elements for the small pool */
 		proto->gpu_hostbuf_small_send_cfg.bufsz = GPU_SMALLHOSTBUF_SZ;
@@ -492,6 +594,8 @@ psm3_ips_proto_init(psm2_ep_t ep, const ptl_t *ptl,
 						"Couldn't allocate GPU host small send buffer pool");
 			goto fail;
 		}
+		psm3_mpool_get_obj_info(proto->gpu_hostbuf_pool_small_send,
+					NULL, &small_pool_num_obj_max_total);
 
 		/* Configure the amount of prefetching */
 		union psmi_envvar_val env_prefetch_limit;
@@ -502,6 +606,12 @@ psm3_ips_proto_init(psm2_ep_t ep, const ptl_t *ptl,
 			    (union psmi_envvar_val)GPU_WINDOW_PREFETCH_DEFAULT,
 			    &env_prefetch_limit);
 		proto->gpu_prefetch_limit = env_prefetch_limit.e_uint;
+		_HFI_DBG("GPU Send Copy Pipeline: %u of %u bytes (small), %u of %u bytes, prefetch %u\n",
+			small_pool_num_obj_max_total,
+			proto->gpu_hostbuf_small_send_cfg.bufsz,
+			pool_num_obj_max_total,
+			proto->gpu_hostbuf_send_cfg.bufsz,
+			proto->gpu_prefetch_limit);
 	}
 #endif /* PSM_CUDA || PSM_ONEAPI */
 
@@ -530,7 +640,8 @@ psm3_ips_proto_init(psm2_ep_t ep, const ptl_t *ptl,
 		// but can survive if it's smaller as we will delay transfer til avail
 		if (protoexp_flags & IPS_PROTOEXP_FLAG_ENABLED) {
 			cache_pri_entries =  HFI_TF_NFLOWS + proto->ep->hfi_num_send_rdma;
-			cache_pri_size  = (uint64_t)cache_pri_entries * proto->mq->hfi_base_window_rv;
+			cache_pri_size  = (uint64_t)cache_pri_entries *
+					psm3_mq_max_window_rv(proto->mq, 0);
 			if (MR_CACHE_USER_CACHING(proto->ep->mr_cache_mode)) {
 				// we attempt to cache, so can benefit from more than inflight
 				// make enough room to have a good number of entries
@@ -578,8 +689,8 @@ psm3_ips_proto_init(psm2_ep_t ep, const ptl_t *ptl,
 				default_cache_entries = max(default_cache_entries,
 								((uint64_t)env_mr_cache_size_mb.e_uint
 									* (1024*1024))
-										/ max( proto->mq->hfi_base_window_rv/2,
-												proto->mq->hfi_thresh_rv));
+										/ max(psm3_mq_max_window_rv(proto->mq, 0)/2,
+												proto->mq->rndv_nic_thresh));
 			} else {
 				// only send DMA, size based on smaller MRs
 				default_cache_entries = max(default_cache_entries,
@@ -677,7 +788,7 @@ psm3_ips_proto_init(psm2_ep_t ep, const ptl_t *ptl,
 #if defined(PSM_CUDA) || defined(PSM_ONEAPI)
 	_HFI_DBG("GDR Copy: %d limit send=%u recv=%u gpu_rndv=%u GPU RDMA flags=0x%x limit send=%u recv=%u\n",
 		is_gdr_copy_enabled, gdr_copy_limit_send, gdr_copy_limit_recv,
-		gpu_thresh_rndv,
+		psm3_gpu_thresh_rndv,
 		proto->flags & (IPS_PROTO_FLAG_GPUDIRECT_RDMA_RECV
 				|IPS_PROTO_FLAG_GPUDIRECT_RDMA_SEND),
 		gpudirect_rdma_send_limit, gpudirect_rdma_recv_limit);
@@ -931,7 +1042,7 @@ proto_sdma_init(struct ips_proto *proto)
 	if (! is_gpudirect_enabled
 	    || !psmi_hal_has_cap(PSM_HAL_CAP_GPUDIRECT_SDMA))
 		env_sdma.e_uint = 0;
-	else 
+	else
 		psm3_getenv("PSM3_GPUDIRECT_SDMA",
 		    "UD GPU send dma flags (0 disables send dma, 1 enables), default 1",
 		    PSMI_ENVVAR_LEVEL_USER, PSMI_ENVVAR_TYPE_UINT_FLAGS,
@@ -1434,6 +1545,7 @@ psm3_ips_proto_flow_flush_pio(struct ips_flow *flow, int *nflushed)
 			// immediately ack the msg
 			struct ips_scb_unackedq *unackedq = &flow->scb_unacked;
 			flow->xmit_ack_num.psn_num = 1 + (__be32_to_cpu(scb->ips_lrh.bth[2]) & proto->psn_mask);
+			flow->xmit_ack_num.psn_num &= proto->psn_mask;
 
 			psmi_assert(scb == STAILQ_FIRST(unackedq));
 			STAILQ_REMOVE_HEAD(unackedq, nextq);
@@ -1502,6 +1614,22 @@ sendfull:
 #else
 		proto->stats.pio_no_flow_credits++;
 #endif
+		if (flow->credits <= 0) {
+//			_HFI_VDBG("flow=%p next=%d first_os=%d delta=%d\n", flow,
+//				flow->xmit_seq_num.psn_num, flow->credits_inc_psn,
+//				flow->xmit_seq_num.psn_num - flow->credits_inc_psn);
+			if (flow->max_credits < proto->max_credits && !between(flow->credits_inc_psn,
+				(flow->credits_inc_psn + proto->credits_inc_thresh) & proto->psn_mask,
+				flow->xmit_seq_num.psn_num)) {
+				// adjust with a small "random" number to avoid potential oscillation
+				uint16_t actual_adjust = min(proto->credits_adjust + (flow->xmit_seq_num.psn_num & 0xF),
+					proto->max_credits - flow->max_credits);
+				flow->max_credits += actual_adjust;
+				flow->credits += actual_adjust;
+				flow->credits_inc_psn = flow->xmit_seq_num.psn_num;
+				_HFI_VDBG("Increased flow (%p) credits to %d\n", flow, flow->max_credits);
+			}
+		}
 		psmi_timer_request(proto->timerq, flow->timer_send,
 				   get_cycles() + proto->timeout_send);
 	}
@@ -1605,9 +1733,8 @@ psm3_ips_proto_timer_ack_callback(struct psmi_timer *current_timer,
 		scb->abs_timeout = t_cyc_next + scb->ack_timeout;
 		if (done_local) {
 			_HFI_VDBG
-			    ("sending err_chk flow=%d with first=%d,last=%d\n",
-			     flow->flowid,
-			     STAILQ_FIRST(&flow->scb_unacked)->seq_num.psn_num,
+			    ("sending err_chk flow=%p with first=%d, last=%d\n",
+			     flow, scb->seq_num.psn_num,
 			     STAILQ_LAST(&flow->scb_unacked, ips_scb,
 					 nextq)->seq_num.psn_num);
 #ifdef PSM_BYTE_FLOW_CREDITS
@@ -1624,23 +1751,29 @@ psm3_ips_proto_timer_ack_callback(struct psmi_timer *current_timer,
 					flow->xmit_seq_num :
 					SLIST_FIRST(&flow->scb_pend)->seq_num;
 
-			if (flow->protocol == PSM_PROTOCOL_TIDFLOW) {
-				// for UD we use RC QP instead of STL100's TIDFLOW HW
-				// UDP has no RDMA
-				psmi_assert_always(0);	// we don't allocate ips_flow for TID
-				message_type = OPCODE_ERR_CHK;	// keep KlockWorks happy
-			} else {
-				PSM2_LOG_MSG("sending ERR_CHK message");
-				message_type = OPCODE_ERR_CHK;
-				err_chk_seq.psn_num = (err_chk_seq.psn_num - 1)
+			PSM2_LOG_MSG("sending ERR_CHK message");
+			message_type = OPCODE_ERR_CHK;
+			err_chk_seq.psn_num = (err_chk_seq.psn_num - 1)
 					& proto->psn_mask;
-			}
 			ctrlscb.ips_lrh.bth[2] =
 					__cpu_to_be32(err_chk_seq.psn_num);
 
 			psm3_ips_proto_send_ctrl_message(flow, message_type,
 					&flow->ipsaddr->ctrl_msg_queued,
 					&ctrlscb, ctrlscb.cksum, 0);
+			flow->credits_inc_psn = scb->seq_num.psn_num;
+			// decrease flow credits
+			if (flow->max_credits > proto->min_credits) {
+				uint16_t actual_adjust = min(proto->credits_adjust + (flow->xmit_seq_num.psn_num & 0xF),
+					flow->max_credits - proto->min_credits);
+				flow->max_credits -= actual_adjust;
+				if (flow->credits > actual_adjust) {
+					flow->credits -= actual_adjust;
+				} else {
+					flow->credits = 0;
+				}
+				_HFI_VDBG("Decreased flow (%p) credits to %d\n", flow, flow->max_credits);
+			}
 		}
 
 		t_cyc_next = get_cycles() + scb->ack_timeout;
@@ -2292,10 +2425,10 @@ ips_proto_register_stats(struct ips_proto *proto)
 				   "RDMA rendezvous message bytes received direct into a GPU buffer",
 				   &proto->strat_stats.rndv_rdma_gdr_recv_bytes),
 		PSMI_STATS_DECLU64("rndv_rdma_hbuf_recv",
-				   "RDMA rendezvous messages received into via pipelined GPU copy",
+				   "RDMA rendezvous messages received into a GPU buffer via pipelined GPU copy",
 				   &proto->strat_stats.rndv_rdma_hbuf_recv),
 		PSMI_STATS_DECLU64("rndv_rdma_hbuf_recv_bytes",
-				   "RDMA rendezvous message bytes received into via pipelined GPU copy",
+				   "RDMA rendezvous message bytes received into a GPU buffer via pipelined GPU copy",
 				   &proto->strat_stats.rndv_rdma_hbuf_recv_bytes),
 #endif
 		PSMI_STATS_DECLU64("rndv_rdma_cpu_send",
@@ -2312,10 +2445,10 @@ ips_proto_register_stats(struct ips_proto *proto)
 				   "RDMA rendezvous message bytes sent from a GPU buffer via send RDMA",
 				   &proto->strat_stats.rndv_rdma_gdr_send_bytes),
 		PSMI_STATS_DECLU64("rndv_rdma_hbuf_send",
-				   "RDMA rendezvous messages sent from a GPU buffer into via pipelined GPU copy",
+				   "RDMA rendezvous messages sent from a GPU buffer via pipelined GPU copy",
 				   &proto->strat_stats.rndv_rdma_hbuf_send),
 		PSMI_STATS_DECLU64("rndv_rdma_hbuf_send_bytes",
-				   "RDMA rendezvous message bytes sent from a GPU buffer into via pipelined GPU copy",
+				   "RDMA rendezvous message bytes sent from a GPU buffer via pipelined GPU copy",
 				   &proto->strat_stats.rndv_rdma_hbuf_send_bytes),
 #endif
 	};

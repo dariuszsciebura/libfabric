@@ -34,23 +34,39 @@ int efa_base_ep_bind_av(struct efa_base_ep *base_ep, struct efa_av *av)
 	return 0;
 }
 
-static int efa_base_ep_destruct_qp(struct efa_base_ep *base_ep)
+int efa_base_ep_destruct_qp(struct efa_base_ep *base_ep)
 {
 	struct efa_domain *domain;
 	struct efa_qp *qp = base_ep->qp;
-	int err;
+	struct efa_qp *user_recv_qp = base_ep->user_recv_qp;
 
 	if (qp) {
 		domain = qp->base_ep->domain;
 		domain->qp_table[qp->qp_num & domain->qp_table_sz_m1] = NULL;
-		err = -ibv_destroy_qp(qp->ibv_qp);
-		if (err)
-			EFA_INFO(FI_LOG_CORE, "destroy qp[%u] failed!\n", qp->qp_num);
+		efa_qp_destruct(qp);
+		base_ep->qp = NULL;
+	}
 
-		free(qp);
+	if (user_recv_qp) {
+		domain = user_recv_qp->base_ep->domain;
+		domain->qp_table[user_recv_qp->qp_num & domain->qp_table_sz_m1] = NULL;
+		efa_qp_destruct(user_recv_qp);
+		base_ep->user_recv_qp = NULL;
 	}
 
 	return 0;
+}
+
+void efa_base_ep_close_util_ep(struct efa_base_ep *base_ep)
+{
+	int err;
+
+	if (base_ep->util_ep_initialized) {
+		err = ofi_endpoint_close(&base_ep->util_ep);
+		if (err)
+			EFA_WARN(FI_LOG_EP_CTRL, "Unable to close util EP\n");
+		base_ep->util_ep_initialized = false;
+	}
 }
 
 int efa_base_ep_destruct(struct efa_base_ep *base_ep)
@@ -59,12 +75,7 @@ int efa_base_ep_destruct(struct efa_base_ep *base_ep)
 
 	/* We need to free the util_ep first to avoid race conditions
 	 * with other threads progressing the cq. */
-	if (base_ep->util_ep_initialized) {
-		err = ofi_endpoint_close(&base_ep->util_ep);
-		if (err)
-			EFA_WARN(FI_LOG_EP_CTRL, "Unable to close util EP\n");
-		base_ep->util_ep_initialized = false;
-	}
+	efa_base_ep_close_util_ep(base_ep);
 
 	fi_freeinfo(base_ep->info);
 
@@ -75,6 +86,9 @@ int efa_base_ep_destruct(struct efa_base_ep *base_ep)
 
 	if (base_ep->efa_recv_wr_vec)
 		free(base_ep->efa_recv_wr_vec);
+	
+	if (base_ep->user_recv_wr_vec)
+		free(base_ep->user_recv_wr_vec);
 
 	return err;
 }
@@ -149,54 +163,89 @@ static int efa_base_ep_modify_qp_rst2rts(struct efa_base_ep *base_ep,
 					   IBV_QP_STATE | IBV_QP_SQ_PSN);
 }
 
-int efa_base_ep_create_qp(struct efa_base_ep *base_ep,
-			  struct ibv_qp_init_attr_ex *init_attr_ex)
+/**
+ * @brief Create a efa_qp
+ *
+ * @param qp double pointer of struct efa_qp
+ * @param init_attr_ex ibv_qp_init_attr_ex
+ * @return int 0 on success, negative integer on failure
+ */
+int efa_qp_create(struct efa_qp **qp, struct ibv_qp_init_attr_ex *init_attr_ex, uint32_t tclass)
 {
-	struct efa_qp *qp;
 	struct efadv_qp_init_attr efa_attr = { 0 };
 
-	qp = calloc(1, sizeof(*qp));
-	if (!qp)
+	*qp = calloc(1, sizeof(struct efa_qp));
+	if (!*qp)
 		return -FI_ENOMEM;
 
+	init_attr_ex->comp_mask = IBV_QP_INIT_ATTR_PD | IBV_QP_INIT_ATTR_SEND_OPS_FLAGS;
+	init_attr_ex->send_ops_flags |= IBV_QP_EX_WITH_SEND | IBV_QP_EX_WITH_SEND_WITH_IMM;
+
 	if (init_attr_ex->qp_type == IBV_QPT_UD) {
-		qp->ibv_qp = ibv_create_qp_ex(init_attr_ex->pd->context,
+		(*qp)->ibv_qp = ibv_create_qp_ex(init_attr_ex->pd->context,
 					      init_attr_ex);
 	} else {
 		assert(init_attr_ex->qp_type == IBV_QPT_DRIVER);
+#if HAVE_CAPS_UNSOLICITED_WRITE_RECV
+		if (efa_rdm_use_unsolicited_write_recv())
+			efa_attr.flags |= EFADV_QP_FLAGS_UNSOLICITED_WRITE_RECV;
+#endif
 		efa_attr.driver_qp_type = EFADV_QP_DRIVER_TYPE_SRD;
-		qp->ibv_qp = efadv_create_qp_ex(
+#if HAVE_EFADV_SL
+		efa_attr.sl = EFA_QP_DEFAULT_SERVICE_LEVEL;
+		if (tclass == FI_TC_LOW_LATENCY)
+			efa_attr.sl = EFA_QP_LOW_LATENCY_SERVICE_LEVEL;
+#endif
+		(*qp)->ibv_qp = efadv_create_qp_ex(
 			init_attr_ex->pd->context, init_attr_ex, &efa_attr,
 			sizeof(struct efadv_qp_init_attr));
 	}
 
-	if (!qp->ibv_qp) {
+#if HAVE_EFADV_SL
+	if (!(*qp)->ibv_qp && tclass == FI_TC_LOW_LATENCY) {
+		EFA_INFO(FI_LOG_EP_CTRL, "ibv_create_qp failed with sl %u, errno: %d. Retrying with default sl.\n", efa_attr.sl, errno);
+		efa_attr.sl = EFA_QP_DEFAULT_SERVICE_LEVEL;
+		(*qp)->ibv_qp = efadv_create_qp_ex(
+			init_attr_ex->pd->context, init_attr_ex, &efa_attr,
+			sizeof(struct efadv_qp_init_attr));
+	}
+#endif
+
+	if (!(*qp)->ibv_qp) {
 		EFA_WARN(FI_LOG_EP_CTRL, "ibv_create_qp failed. errno: %d\n", errno);
-		free(qp);
+		free(*qp);
+		*qp = NULL;
 		return -errno;
 	}
 
-	qp->ibv_qp_ex = ibv_qp_to_qp_ex(qp->ibv_qp);
-	base_ep->qp = qp;
-	qp->base_ep = base_ep;
+	(*qp)->ibv_qp_ex = ibv_qp_to_qp_ex((*qp)->ibv_qp);
+	return FI_SUCCESS;
+}
+
+int efa_base_ep_create_qp(struct efa_base_ep *base_ep,
+			  struct ibv_qp_init_attr_ex *init_attr_ex)
+{
+	int ret;
+
+	ret = efa_qp_create(&base_ep->qp, init_attr_ex, base_ep->info->tx_attr->tclass);
+	if (ret)
+		return ret;
+
+	base_ep->qp->base_ep = base_ep;
 	return 0;
 }
 
 static
-int efa_base_ep_enable_qp(struct efa_base_ep *base_ep)
+int efa_base_ep_enable_qp(struct efa_base_ep *base_ep, struct efa_qp *qp)
 {
-	struct efa_qp *qp;
 	int err;
 
-	qp = base_ep->qp;
 	qp->qkey = (base_ep->util_ep.type == FI_EP_DGRAM) ?
 			   EFA_DGRAM_CONNID :
 			   efa_generate_rdm_connid();
 	err = efa_base_ep_modify_qp_rst2rts(base_ep, qp);
 	if (err)
 		return err;
-
-	base_ep->efa_qp_enabled = true;
 
 	qp->qp_num = qp->ibv_qp->qp_num;
 	base_ep->domain->qp_table[qp->qp_num & base_ep->domain->qp_table_sz_m1] = qp;
@@ -223,13 +272,35 @@ int efa_base_ep_create_self_ah(struct efa_base_ep *base_ep, struct ibv_pd *ibv_p
 	return base_ep->self_ah ? 0 : -FI_EINVAL;
 }
 
+void efa_qp_destruct(struct efa_qp *qp)
+{
+	int err;
+
+	err = -ibv_destroy_qp(qp->ibv_qp);
+	if (err)
+		EFA_INFO(FI_LOG_CORE, "destroy qp[%u] failed, err: %s\n", qp->qp_num, fi_strerror(-err));
+	free(qp);
+}
+
 int efa_base_ep_enable(struct efa_base_ep *base_ep)
 {
 	int err;
 
-	err = efa_base_ep_enable_qp(base_ep);
-	if (err)
+	err = efa_base_ep_enable_qp(base_ep, base_ep->qp);
+	if (err) {
+		efa_base_ep_destruct_qp(base_ep);
 		return err;
+	}
+
+	base_ep->efa_qp_enabled = true;
+
+	if (base_ep->user_recv_qp) {
+		err = efa_base_ep_enable_qp(base_ep, base_ep->user_recv_qp);
+		if (err) {
+			efa_base_ep_destruct_qp(base_ep);
+			return err;
+		}
+	}
 
 	memcpy(base_ep->src_addr.raw, base_ep->domain->device->ibv_gid.raw, EFA_GID_LEN);
 	base_ep->src_addr.qpn = base_ep->qp->qp_num;
@@ -273,14 +344,25 @@ int efa_base_ep_construct(struct efa_base_ep *base_ep,
 
 	base_ep->rnr_retry = efa_env.rnr_retry;
 
-	base_ep->xmit_more_wr_tail = &base_ep->xmit_more_wr_head;
-	base_ep->recv_more_wr_tail = &base_ep->recv_more_wr_head;
 	base_ep->efa_recv_wr_vec = calloc(sizeof(struct efa_recv_wr), EFA_RDM_EP_MAX_WR_PER_IBV_POST_RECV);
 	if (!base_ep->efa_recv_wr_vec) {
 		EFA_WARN(FI_LOG_EP_CTRL, "cannot alloc memory for base_ep->efa_recv_wr_vec!\n");
 		return -FI_ENOMEM;
 	}
+	base_ep->user_recv_wr_vec = calloc(sizeof(struct efa_recv_wr), EFA_RDM_EP_MAX_WR_PER_IBV_POST_RECV);
+	if (!base_ep->user_recv_wr_vec) {
+		EFA_WARN(FI_LOG_EP_CTRL, "cannot alloc memory for base_ep->user_recv_wr_vec!\n");
+		return -FI_ENOMEM;
+	}
+	base_ep->recv_wr_index = 0;
 	base_ep->efa_qp_enabled = false;
+	base_ep->qp = NULL;
+	base_ep->user_recv_qp = NULL;
+
+	base_ep->max_msg_size = info->ep_attr->max_msg_size;
+	base_ep->max_rma_size = info->ep_attr->max_msg_size;
+	base_ep->inject_msg_size = info->tx_attr->inject_size;
+	base_ep->inject_rma_size = info->tx_attr->inject_size;
 	return 0;
 }
 
@@ -333,17 +415,17 @@ int efa_base_ep_getname(fid_t fid, void *addr, size_t *addrlen)
  * 		in-order operation.
  */
 #if HAVE_EFA_DATA_IN_ORDER_ALIGNED_128_BYTES
-bool efa_base_ep_support_op_in_order_aligned_128_bytes(struct efa_base_ep *base_ep, enum ibv_wr_opcode op)
+bool efa_qp_support_op_in_order_aligned_128_bytes(struct efa_qp *qp, enum ibv_wr_opcode op)
 {
 	int caps;
 
-	caps = ibv_query_qp_data_in_order(base_ep->qp->ibv_qp, op,
+	caps = ibv_query_qp_data_in_order(qp->ibv_qp, op,
 					  IBV_QUERY_QP_DATA_IN_ORDER_RETURN_CAPS);
 
 	return !!(caps & IBV_QUERY_QP_DATA_IN_ORDER_ALIGNED_128_BYTES);
 }
 #else
-bool efa_base_ep_support_op_in_order_aligned_128_bytes(struct efa_base_ep *base_ep, enum ibv_wr_opcode op)
+bool efa_qp_support_op_in_order_aligned_128_bytes(struct efa_qp *qp, enum ibv_wr_opcode op)
 {
 	return false;
 }

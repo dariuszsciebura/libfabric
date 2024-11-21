@@ -39,7 +39,6 @@
 
 #include "config.h"
 
-#include <asm/types.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <arpa/inet.h>
@@ -79,6 +78,22 @@
 
 #include "ofi_verbs_compat.h"
 
+/* define LONG_WIDTH used by atomics */
+#include <limits.h>
+#ifndef LONG_WIDTH
+#ifdef LONG_BIT
+#define LONG_WIDTH LONG_BIT
+#elif defined(HAVE_ASM_TYPES_H)
+#include <asm/types.h>
+#define LONG_WIDTH __BITS_PER_LONG
+#elif defined(__x86_64__) || defined(__aarch64__)
+#ifndef __ILP32__
+#define LONG_WIDTH 64
+#else
+#define LONG_WIDTH 32
+#endif
+#endif
+#endif
 
 #ifndef AF_IB
 #define AF_IB 27
@@ -145,6 +160,15 @@
 
 #define VERBS_ANY_DOMAIN "verbs_any_domain"
 #define VERBS_ANY_FABRIC "verbs_any_fabric"
+
+#ifdef HAVE_FABRIC_PROFILE
+struct vrb_profile;
+typedef struct vrb_profile    vrb_profile_t;
+
+#else
+typedef void  vrb_profile_t;
+
+#endif
 
 extern struct fi_provider vrb_prov;
 extern struct util_prov vrb_util_prov;
@@ -262,9 +286,10 @@ struct vrb_progress {
 	struct ofi_genlock	*active_lock;
 
 	struct ofi_bufpool	*ctx_pool;
+	struct ofi_bufpool	*recv_wr_pool;
 };
 
-int vrb_init_progress(struct vrb_progress *progress, struct ibv_context *verbs);
+int vrb_init_progress(struct vrb_progress *progress, struct fi_info *info);
 void vrb_close_progress(struct vrb_progress *progress);
 
 struct vrb_eq_entry {
@@ -352,6 +377,9 @@ struct vrb_pep {
 	int			bound;
 	size_t			src_addrlen;
 	struct fi_info		*info;
+
+	/* for profiling */
+	vrb_profile_t		*profile;
 };
 
 struct fi_ops_cm *vrb_pep_ops_cm(struct vrb_pep *pep);
@@ -404,6 +432,9 @@ struct vrb_domain {
 
 	/* MR stuff */
 	struct ofi_mr_cache		cache;
+
+	/* for profiling */
+	vrb_profile_t		*profile;
 };
 
 struct vrb_cq;
@@ -574,6 +605,7 @@ struct vrb_xrc_ep_conn_setup {
 
 enum vrb_ep_state {
 	VRB_IDLE,
+	VRB_RESOLVE_ADDR,
 	VRB_RESOLVE_ROUTE,
 	VRB_CONNECTING,
 	VRB_REQ_RCVD,
@@ -592,6 +624,7 @@ struct vrb_ep {
 	uint64_t			saved_peer_rq_credits;
 	struct slist			sq_list;
 	struct slist			rq_list;
+	struct slist			prepost_wr_list;
 	/* Protected by recv CQ lock */
 	int64_t				rq_credits_avail;
 	int64_t				threshold;
@@ -631,6 +664,9 @@ struct vrb_ep {
 	struct vrb_cm_data_hdr		*cm_hdr;
 	void				*cm_priv_data;
 	bool				hmem_enabled;
+
+	/* for profiling */
+	vrb_profile_t			*profile;
 };
 
 
@@ -781,6 +817,9 @@ void vrb_eq_remove_sidr_conn(struct vrb_xrc_ep *ep);
 
 void vrb_msg_ep_get_qp_attr(struct vrb_ep *ep,
 			       struct ibv_qp_init_attr *attr);
+void vrb_msg_ep_prepare_rdma_cm_hdr(void *priv_data,
+				    const struct rdma_cm_id *id);
+
 int vrb_process_xrc_connreq(struct vrb_ep *ep,
 			       struct vrb_connreq *connreq);
 
@@ -933,9 +972,16 @@ do {								\
 	( wr->opcode == IBV_WR_SEND || wr->opcode == IBV_WR_SEND_WITH_IMM	\
 	|| wr->opcode == IBV_WR_RDMA_WRITE_WITH_IMM )
 
+struct vrb_recv_wr {
+	struct slist_entry	entry;
+	struct ibv_recv_wr	wr;
+	struct ibv_sge		sge[0];
+};
+
 void vrb_shutdown_ep(struct vrb_ep *ep);
 ssize_t vrb_post_send(struct vrb_ep *ep, struct ibv_send_wr *wr, uint64_t flags);
 ssize_t vrb_post_recv(struct vrb_ep *ep, struct ibv_recv_wr *wr);
+int vrb_post_recv_internal(struct vrb_ep *ep, struct ibv_recv_wr *wr);
 
 static inline ssize_t
 vrb_send_buf(struct vrb_ep *ep, struct ibv_send_wr *wr,
@@ -990,5 +1036,99 @@ vrb_free_ctx(struct vrb_progress *progress, struct vrb_context *ctx)
 	assert(ofi_genlock_held(progress->active_lock));
 	ofi_buf_free(ctx);
 }
+
+static inline struct vrb_recv_wr *vrb_alloc_recv_wr(struct vrb_progress *progress)
+{
+	assert(ofi_genlock_held(progress->active_lock));
+	return ofi_buf_alloc(progress->recv_wr_pool);
+}
+
+static inline void
+vrb_free_recv_wr(struct vrb_progress *progress, struct vrb_recv_wr *wr)
+{
+	assert(ofi_genlock_held(progress->active_lock));
+	ofi_buf_free(wr);
+}
+
+int vrb_ep_ops_open(struct fid *fid, const char *name,
+                     uint64_t flags, void **ops, void *context);
+
+#ifdef HAVE_FABRIC_PROFILE
+#include <ofi_profile.h>
+#define VRB_MAX_STATES  (VRB_DISCONNECTED + 1)
+
+struct vrb_prof_state_time {
+        uint64_t start;
+        uint64_t time[VRB_MAX_STATES];
+};
+
+enum {
+        VRB_ACTIVE_CONN,
+        VRB_PASSIVE_CONN,
+};
+
+#define VRB_PROF_TIMERS   (VRB_PASSIVE_CONN + 1)
+// verbs supported variables defined in fi_profile.h
+// from FI_VAR_MSG_QUEUE_CNT to FI_VAR_CONN_REJECT
+#define VRB_PROF_VARS     5
+
+struct vrb_prof_counter {
+        uint64_t cntr[VRB_PROF_VARS];
+};
+
+struct vrb_profile {
+        struct util_profile util_prof;
+        struct vrb_prof_counter *vars;  // pointer to an entry in counters table
+        struct vrb_prof_state_time *state;    // pointer to an entry in conntion table
+};
+
+// support verbs connection counters
+#define vrb_prof_var2_cntr(var)    ((var) - FI_VAR_MSG_QUEUE_CNT)
+#define vrb_prof_cntr2_var(cntr)   ((cntr) + FI_VAR_MSG_QUEUE_CNT)
+
+#define vrb_prof_cntr_inc(prof, var) \
+do { \
+        (prof)->vars->cntr[vrb_prof_var2_cntr((var))] += 1; \
+} while (0)
+
+#define vrb_prof_cntr_inc_val(prof, var, val) \
+do { \
+	(prof)->vars->cntr[vrb_prof_var2_cntr((var))] += (val); \
+} while (0)
+
+#define vrb_prof_st_start(prof, cur_time) \
+do { \
+        (prof)->state->start = (cur_time); \
+} while (0)
+
+#define vrb_prof_set_st_time(prof, cur_time, st) \
+do { \
+        if ((prof)->state->start) \
+                (prof)->state->time[(st)] =  \
+                        ((cur_time) - (prof)->state->start); \
+} while (0)
+
+void vrb_prof_report(struct vrb_profile *prof);
+void vrb_prof_init_state(struct vrb_profile *prof, uint64_t cur_time, int type);
+void vrb_prof_func_start(const char *fname);
+void vrb_prof_func_end(const char *fname);
+void vrb_prof_init();
+
+#else
+
+#define vrb_prof_cntr_inc(prof, var)			do {} while (0)
+#define vrb_prof_cntr_inc_val(prof, var, val)		do {} while (0)
+#define vrb_prof_st_start(prof, cur_time)		do {} while (0)
+#define vrb_prof_set_st_time(prof, cur_time, state)	do {} while (0)
+#define vrb_prof_report(prof)				do {} while (0)
+#define vrb_prof_init_state(prof, cur_time, type)	do {} while (0)
+#define vrb_prof_func_start(fname)			do {} while (0)
+#define vrb_prof_func_end(fname)			do {} while (0)
+#define vrb_prof_init()					do {} while (0)
+
+#endif
+
+int vrb_prof_create(vrb_profile_t **prof);
+
 
 #endif /* VERBS_OFI_H */

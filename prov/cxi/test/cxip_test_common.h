@@ -41,9 +41,6 @@ extern bool cxit_prov_key;
 extern int s_page_size;
 extern bool enable_cxi_hmem_ops;
 
-extern bool cxip_trace_enable(bool enable);
-extern void cxip_trace_flush(void);
-
 void cxit_init(void);
 void cxit_create_fabric_info(void);
 void cxit_destroy_fabric_info(void);
@@ -68,8 +65,12 @@ void cxit_destroy_av(void);
 void cxit_bind_av(void);
 
 void cxit_setup_rma_disable_fi_rma_event(void);
+void cxit_setup_enabled_rnr_msg_ep(void);
+void cxit_setup_rnr_msg_ep(void);
 struct fi_info *cxit_allocinfo(void);
+struct fi_info *cxit_allocinfo_proto(uint32_t proto);
 void cxit_setup_getinfo(void);
+void cxit_setup_getinfo_proto(uint32_t proto);
 void cxit_teardown_getinfo(void);
 void cxit_setup_fabric(void);
 void cxit_teardown_fabric(void);
@@ -88,6 +89,8 @@ void cxit_setup_enabled_ep_fd(void);
 void cxit_setup_rma(void);
 void cxit_setup_rma_fd(void);
 void cxit_setup_rma_hybrid_mr_desc(void);
+void cxit_setup_rma_rnr_hybrid_mr_desc(void);
+void cxit_setup_rma_rnr_hybrid_mr_desc_byte_cntr(void);
 void cxit_setup_rma_mr_events(void);
 #define cxit_setup_tagged cxit_setup_rma
 #define cxit_setup_msg cxit_setup_rma

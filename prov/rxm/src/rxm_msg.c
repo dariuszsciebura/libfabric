@@ -240,7 +240,7 @@ rxm_recvmsg(struct fid_ep *ep_fid, const struct fi_msg *msg, uint64_t flags)
 	struct rxm_ep *rxm_ep = container_of(ep_fid, struct rxm_ep,
 					     util_ep.ep_fid.fid);
 
-	if (rxm_ep->rxm_info->mode & FI_BUFFERED_RECV)
+	if (rxm_ep->rxm_info->mode & OFI_BUFFERED_RECV)
 		return rxm_buf_recv(rxm_ep, msg->msg_iov, msg->desc,
 				    msg->iov_count, msg->addr, msg->context,
 				    flags | rxm_ep->util_ep.rx_msg_flags);
@@ -329,7 +329,7 @@ rxm_alloc_rndv_buf(struct rxm_ep *rxm_ep, struct rxm_conn *rxm_conn,
 
 	len = sizeof(struct rxm_pkt) + sizeof(struct rxm_rndv_hdr);
 
-	if (rxm_ep->rxm_info->mode & FI_BUFFERED_RECV) {
+	if (rxm_ep->rxm_info->mode & OFI_BUFFERED_RECV) {
 		ret = ofi_copy_from_hmem_iov(rxm_pkt_rndv_data(&(*rndv_buf)->pkt),
 					     rxm_ep->buffered_min, iface,
 					     device, iov, count, 0);
@@ -473,7 +473,7 @@ rxm_send_sar(struct rxm_ep *rxm_ep, struct rxm_conn *rxm_conn,
 	ssize_t ret;
 
 	assert(segs_cnt >= 2);
-	iface = rxm_mr_desc_to_hmem_iface_dev(desc, count, &device);
+	iface = rxm_iov_desc_to_hmem_iface_dev(iov, desc, count, &device);
 
 	first_tx_buf = rxm_init_segment(rxm_ep, rxm_conn, context,
 					data_len, rxm_buffer_size,
@@ -709,7 +709,7 @@ rxm_send_common(struct rxm_ep *rxm_ep, struct rxm_conn *rxm_conn,
 		(data_len > rxm_ep->rxm_info->tx_attr->inject_size)) ||
 	       (data_len <= rxm_ep->rxm_info->tx_attr->inject_size));
 
-	iface = rxm_mr_desc_to_hmem_iface_dev(desc, count, &device);
+	iface = rxm_iov_desc_to_hmem_iface_dev(iov, desc, count, &device);
 	if (iface == FI_HMEM_ZE || iface == FI_HMEM_SYNAPSEAI)
 		goto rndv_send;
 

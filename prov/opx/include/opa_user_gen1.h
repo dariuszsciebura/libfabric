@@ -6,7 +6,7 @@
   GPL LICENSE SUMMARY
 
   Copyright(c) 2015 Intel Corporation.
-  Copyright(c) 2021-2023 Cornelis Networks.
+  Copyright(c) 2021-2024 Cornelis Networks.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of version 2 of the GNU General Public License as
@@ -17,13 +17,10 @@
   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
   General Public License for more details.
 
-  Contact Information:
-  Intel Corporation, www.intel.com
-
   BSD LICENSE
 
   Copyright(c) 2015 Intel Corporation.
-  Copyright(c) 2021-2022 Cornelis Networks.
+  Copyright(c) 2021-2024 Cornelis Networks.
 
   Redistribution and use in source and binary forms, with or without
   modification, are permitted provided that the following conditions
@@ -86,6 +83,7 @@
 #include "opa_udebug.h"
 #include "opa_service.h"
 #include "opa_user.h"
+#include "ofi_mem.h"
 
 #define HFI_RHF_USE_EGRBFR_MASK 0x1
 #define HFI_RHF_USE_EGRBFR_SHIFT 15
@@ -332,7 +330,10 @@ int opx_hfi_event_ack(struct _hfi_ctrl *ctrl, __u64 ackbits);
 int opx_hfi_poll_type(struct _hfi_ctrl *ctrl, uint16_t poll_type);
 
 /* reset halted send context, error if context is not halted. */
-int opx_hfi_reset_context(struct _hfi_ctrl *ctrl);
+int opx_hfi_reset_context(int fd);
+
+/* ack hfi events */
+int opx_hfi_ack_events(int fd, uint64_t ackbits);
 
 /*
 * Safe version of opx_hfi_[d/q]wordcpy that is guaranteed to only copy each byte once.
@@ -542,13 +543,17 @@ static __inline__ void opx_hfi_hdrset_seq(__le32 *rbuf, uint32_t val)
    See full description at declaration */
 static __inline__ int32_t opx_hfi_update_tid(struct _hfi_ctrl *ctrl,
 					 uint64_t vaddr, uint32_t *length,
-					 uint64_t tidlist, uint32_t *tidcnt, uint16_t flags)
+					 uint64_t tidlist, uint32_t *tidcnt,
+					 uint64_t flags)
 {
 	struct hfi1_cmd cmd;
+
+#ifdef OPX_HMEM
+	struct hfi1_tid_info_v3 tidinfo;
+#else
 	struct hfi1_tid_info tidinfo;
-#ifdef PSM_CUDA
-	struct hfi1_tid_info_v2 tidinfov2;
 #endif
+
 	int err;
 
 	tidinfo.vaddr = vaddr;		/* base address for this send to map */
@@ -557,50 +562,67 @@ static __inline__ int32_t opx_hfi_update_tid(struct _hfi_ctrl *ctrl,
 	tidinfo.tidlist = tidlist;	/* driver copies tids back directly */
 	tidinfo.tidcnt = 0;		/* clear to zero */
 
-	FI_DBG(&fi_opx_provider, FI_LOG_MR,"OPX_DEBUG_ENTRY update [%p - %p], length %u (pages %u)\n", (void*)vaddr,(void*)(vaddr + *length), *length, (*length)/4096);
-
+#ifdef OPX_HMEM
+	cmd.type = OPX_HFI_CMD_TID_UPDATE_V3;
+	tidinfo.flags = flags;
+	tidinfo.context = 0ull;
+#else
 	cmd.type = OPX_HFI_CMD_TID_UPDATE; /* HFI1_IOCTL_TID_UPDATE */
+#endif
+	FI_DBG(&fi_opx_provider, FI_LOG_MR,
+		"OPX_DEBUG_ENTRY update [%p - %p], length %u (pages %lu)\n",
+		(void*)vaddr, (void*) (vaddr + *length), *length, (*length) / page_sizes[OFI_PAGE_SIZE]);
+
 	cmd.len = sizeof(tidinfo);
 	cmd.addr = (__u64) &tidinfo;
-#ifdef PSM_CUDA
-	if (PSMI_IS_DRIVER_GPUDIRECT_ENABLED) {
-		/* Copy values to v2 struct */
-		tidinfov2.vaddr   = tidinfo.vaddr;
-		tidinfov2.length  = tidinfo.length;
-		tidinfov2.tidlist = tidinfo.tidlist;
-		tidinfov2.tidcnt  = tidinfo.tidcnt;
-		tidinfov2.flags   = flags;
 
-		cmd.type = OPX_HFI_CMD_TID_UPDATE_V2;
-		cmd.len = sizeof(tidinfov2);
-		cmd.addr = (__u64) &tidinfov2;
-	}
-#endif
 	errno = 0;
 	err = opx_hfi_cmd_write(ctrl->fd, &cmd, sizeof(cmd));
-	__attribute__((__unused__)) int saved_errno = errno;
 
 	if (err != -1) {
+		assert(err == 0);
 		struct hfi1_tid_info *rettidinfo =
 			(struct hfi1_tid_info *)cmd.addr;
-		if ((rettidinfo->length != *length) || (rettidinfo->tidcnt == 0) ) {
-			FI_WARN(&fi_opx_provider, FI_LOG_MR,"PARTIAL UPDATE errno %d  \"%s\" INPUTS vaddr [%p - %p] length %u (pages %u), OUTPUTS vaddr [%p - %p] length %u (pages %u), tidcnt %u\n", saved_errno, strerror(saved_errno), (void*)vaddr,(void*)(vaddr + *length), *length, (*length)/4096, (void*)vaddr,(void*)(vaddr + rettidinfo->length), rettidinfo->length, rettidinfo->length/4096, rettidinfo->tidcnt);
+		assert(rettidinfo->length);
+		assert(rettidinfo->tidcnt);
+
+		if (rettidinfo->length != *length) {
+			FI_WARN(&fi_opx_provider, FI_LOG_MR,
+				"PARTIAL UPDATE errno %d  \"%s\" INPUTS vaddr [%p - %p] length %u (pages %lu), OUTPUTS vaddr [%p - %p] length %u (pages %lu), tidcnt %u\n",
+				errno, strerror(errno), (void*)vaddr,
+				(void*)(vaddr + *length), *length, (*length) / page_sizes[OFI_PAGE_SIZE],
+				(void*)rettidinfo->vaddr,(void*)(rettidinfo->vaddr + rettidinfo->length),
+				rettidinfo->length, rettidinfo->length / page_sizes[OFI_PAGE_SIZE],
+				rettidinfo->tidcnt);
 		}
-                /* Always update outputs, even on soft errors */
+		/* Always update outputs, even on soft errors */
 		*length = rettidinfo->length;
 		*tidcnt = rettidinfo->tidcnt;
-		FI_DBG(&fi_opx_provider, FI_LOG_MR,"OPX_DEBUG_EXIT OUTPUTS errno %d  \"%s\" vaddr [%p - %p] length %u (pages %u), tidcnt %u\n", saved_errno, strerror(saved_errno), (void*)vaddr,(void*)(vaddr + *length), *length, (*length)/4096, *tidcnt);
 
-	} else {
-		FI_WARN(&fi_opx_provider, FI_LOG_MR,"FAILED ERR %d errno %d \"%s\"\n", err, saved_errno, strerror(saved_errno));
-		/* Hard error, we can't trust these */
-		*length = 0;
-		*tidcnt = 0;
+		FI_DBG(&fi_opx_provider, FI_LOG_MR,
+			"TID UPDATE IOCTL returned %d errno %d  \"%s\" vaddr [%p - %p] length %u (pages %lu), tidcnt %u\n",
+			err, errno, strerror(errno), (void*)vaddr,
+			(void*)(vaddr + *length), *length, (*length) / page_sizes[OFI_PAGE_SIZE], *tidcnt);
+
+		return 0;
 	}
 
-	/* Either length or tidcnt may be reduced on return
-	 * if there are resource limitations (soft errors)
-	 * in the driver */
+	if (errno == ENOSPC) {
+		FI_DBG(&fi_opx_provider, FI_LOG_MR,
+			"IOCTL FAILED : No TIDs available, requested range=%p-%p (%u bytes, %lu pages)\n",
+			(void*)vaddr, (void*) (vaddr + *length), *length, (*length) / page_sizes[OFI_PAGE_SIZE]);
+		err = -FI_ENOSPC;
+	} else {
+		FI_WARN(&fi_opx_provider, FI_LOG_MR,
+			"IOCTL FAILED ERR %d errno %d \"%s\" requested range=%p-%p (%u bytes, %lu pages)\n",
+			err, errno, strerror(errno),
+			(void*)vaddr, (void*) (vaddr + *length), *length, (*length) / page_sizes[OFI_PAGE_SIZE]);
+	}
+
+	/* Hard error, we can't trust these */
+	*length = 0;
+	*tidcnt = 0;
+
 	return err;
 }
 

@@ -18,9 +18,8 @@
 #define CXIP_WARN(...) _CXIP_WARN(FI_LOG_EP_CTRL, __VA_ARGS__)
 #define CXIP_INFO(...) _CXIP_INFO(FI_LOG_EP_CTRL, __VA_ARGS__)
 
-#define CXIP_SC_STATS "FC/SC stats - EQ full: %d append fail: %d no match: %d"\
-		      " request full: %d unexpected: %d, NIC HW2SW unexp: %d"\
-		      " NIC HW2SW append fail: %d\n"
+extern struct cxip_rxc_ops hpc_rxc_ops;
+extern struct cxip_rxc_ops rnr_rxc_ops;
 
 /*
  * cxip_rxc_msg_enable() - Enable RXC messaging.
@@ -31,7 +30,7 @@
  *
  * Caller must hold ep_obj->lock.
  */
-int cxip_rxc_msg_enable(struct cxip_rxc *rxc, uint32_t drop_count)
+int cxip_rxc_msg_enable(struct cxip_rxc_hpc *rxc, uint32_t drop_count)
 {
 	int ret;
 
@@ -39,15 +38,15 @@ int cxip_rxc_msg_enable(struct cxip_rxc *rxc, uint32_t drop_count)
 	 * synchronous call is used which handles drop count mismatches.
 	 */
 	if (rxc->new_state == RXC_ENABLED_SOFTWARE) {
-		ret = cxil_pte_transition_sm(rxc->rx_pte->pte, drop_count);
+		ret = cxil_pte_transition_sm(rxc->base.rx_pte->pte, drop_count);
 		if (ret)
 			RXC_WARN(rxc,
 				 "Error transitioning to SW EP %d %s\n",
-				  ret, fi_strerror(-ret));
+				 ret, fi_strerror(-ret));
 		return ret;
 	}
 
-	return cxip_pte_set_state(rxc->rx_pte, rxc->rx_cmdq,
+	return cxip_pte_set_state(rxc->base.rx_pte, rxc->base.rx_cmdq,
 				  C_PTLTE_ENABLED, drop_count);
 }
 
@@ -76,177 +75,6 @@ static int rxc_msg_disable(struct cxip_rxc *rxc)
 		CXIP_DBG("RXC PtlTE disabled: %p\n", rxc);
 
 	return ret;
-}
-
-#define RXC_RESERVED_FC_SLOTS 1
-
-/*
- * rxc_msg_init() - Initialize an RX context for messaging.
- *
- * Allocates and initializes hardware resources used for receiving expected and
- * unexpected message data.
- *
- * Caller must hold ep_obj->lock.
- */
-static int rxc_msg_init(struct cxip_rxc *rxc)
-{
-	int ret;
-	struct cxi_pt_alloc_opts pt_opts = {
-		.use_long_event = 1,
-		.is_matching = 1,
-		.en_flowctrl = 1,
-		.lossless = cxip_env.msg_lossless,
-	};
-	struct cxi_cq_alloc_opts cq_opts = {};
-
-	ret = cxip_ep_cmdq(rxc->ep_obj, false, FI_TC_UNSPEC,
-			   rxc->rx_evtq.eq, &rxc->rx_cmdq);
-	if (ret != FI_SUCCESS) {
-		CXIP_WARN("Unable to allocate RX CMDQ, ret: %d\n", ret);
-		return -FI_EDOMAIN;
-	}
-
-	/* For FI_TC_UNSPEC, reuse the TX context command queue if possible. If
-	 * a specific traffic class is requested, allocate a new command queue.
-	 * This is done to prevent performance issues with reusing the TX
-	 * context command queue and changing the communication profile.
-	 */
-	if (cxip_env.rget_tc == FI_TC_UNSPEC) {
-		ret = cxip_ep_cmdq(rxc->ep_obj, true, FI_TC_UNSPEC,
-				   rxc->rx_evtq.eq, &rxc->tx_cmdq);
-		if (ret != FI_SUCCESS) {
-			CXIP_WARN("Unable to allocate TX CMDQ, ret: %d\n", ret);
-			ret = -FI_EDOMAIN;
-			goto put_rx_cmdq;
-		}
-	} else {
-		cq_opts.count = rxc->ep_obj->txq_size * 4;
-		cq_opts.flags = CXI_CQ_IS_TX;
-		cq_opts.policy = cxip_env.cq_policy;
-
-		ret = cxip_cmdq_alloc(rxc->ep_obj->domain->lni,
-				      rxc->rx_evtq.eq, &cq_opts,
-				      rxc->ep_obj->auth_key.vni,
-				      cxip_ofi_to_cxi_tc(cxip_env.rget_tc),
-				      CXI_TC_TYPE_DEFAULT, &rxc->tx_cmdq);
-		if (ret != FI_SUCCESS) {
-			CXIP_WARN("Unable to allocate CMDQ, ret: %d\n", ret);
-			ret = -FI_ENOSPC;
-			goto put_rx_cmdq;
-		}
-	}
-
-	/* If applications AVs are symmetric, use logical FI addresses for
-	 * matching. Otherwise, physical addresses will be used.
-	 */
-	if (rxc->ep_obj->av->symmetric) {
-		CXIP_DBG("Using logical PTE matching\n");
-		pt_opts.use_logical = 1;
-	}
-
-	ret = cxip_pte_alloc(rxc->ep_obj->ptable,
-			     rxc->rx_evtq.eq, CXIP_PTL_IDX_RXQ, false,
-			     &pt_opts, cxip_recv_pte_cb, rxc, &rxc->rx_pte);
-	if (ret != FI_SUCCESS) {
-		CXIP_WARN("Failed to allocate RX PTE: %d\n", ret);
-		goto put_tx_cmdq;
-	}
-
-	/* One slot must be reserved to support hardware generated state change
-	 * events.
-	 */
-	ret = cxip_evtq_adjust_reserved_fc_event_slots(&rxc->rx_evtq,
-						       RXC_RESERVED_FC_SLOTS);
-	if (ret) {
-		CXIP_WARN("Unable to adjust RX reserved event slots: %d\n",
-			  ret);
-		goto free_pte;
-	}
-
-	return FI_SUCCESS;
-
-free_pte:
-	cxip_pte_free(rxc->rx_pte);
-put_tx_cmdq:
-	if (cxip_env.rget_tc == FI_TC_UNSPEC)
-		cxip_ep_cmdq_put(rxc->ep_obj, true);
-	else
-		cxip_cmdq_free(rxc->tx_cmdq);
-put_rx_cmdq:
-	cxip_ep_cmdq_put(rxc->ep_obj, false);
-
-	return ret;
-}
-
-/*
- * rxc_msg_fini() - Finalize RX context messaging.
- *
- * Free hardware resources allocated when the RX context was initialized for
- * messaging.
- *
- * Caller must hold ep_obj->lock.
- */
-static int rxc_msg_fini(struct cxip_rxc *rxc)
-{
-	int ret __attribute__((unused));
-
-	cxip_pte_free(rxc->rx_pte);
-
-	cxip_ep_cmdq_put(rxc->ep_obj, false);
-
-	if (cxip_env.rget_tc == FI_TC_UNSPEC)
-		cxip_ep_cmdq_put(rxc->ep_obj, true);
-	else
-		cxip_cmdq_free(rxc->tx_cmdq);
-
-	cxip_evtq_adjust_reserved_fc_event_slots(&rxc->rx_evtq,
-						 -1 * RXC_RESERVED_FC_SLOTS);
-
-	cxip_evtq_fini(&rxc->rx_evtq);
-
-	return FI_SUCCESS;
-}
-
-static void cxip_rxc_free_ux_entries(struct cxip_rxc *rxc)
-{
-	struct cxip_ux_send *ux_send;
-	struct dlist_entry *tmp;
-
-	/* TODO: Manage freeing of UX entries better. This code is redundant
-	 * with the freeing in cxip_recv_sw_matcher().
-	 */
-	dlist_foreach_container_safe(&rxc->sw_ux_list, struct cxip_ux_send,
-				     ux_send, rxc_entry, tmp) {
-		dlist_remove(&ux_send->rxc_entry);
-		if (ux_send->req && ux_send->req->type == CXIP_REQ_RBUF)
-			cxip_req_buf_ux_free(ux_send);
-		else
-			free(ux_send);
-
-		rxc->sw_ux_list_len--;
-	}
-
-	if (rxc->sw_ux_list_len != 0)
-		CXIP_WARN("sw_ux_list_len %d != 0\n", rxc->sw_ux_list_len);
-	assert(rxc->sw_ux_list_len == 0);
-
-	/* Free any pending UX entries waiting from the request list */
-	dlist_foreach_container_safe(&rxc->sw_pending_ux_list,
-				     struct cxip_ux_send, ux_send,
-				     rxc_entry, tmp) {
-		dlist_remove(&ux_send->rxc_entry);
-		if (ux_send->req->type == CXIP_REQ_RBUF)
-			cxip_req_buf_ux_free(ux_send);
-		else
-			free(ux_send);
-
-		rxc->sw_pending_ux_list_len--;
-	}
-
-	if (rxc->sw_pending_ux_list_len != 0)
-		CXIP_WARN("sw_pending_ux_list_len %d != 0\n",
-			  rxc->sw_pending_ux_list_len);
-	assert(rxc->sw_pending_ux_list_len == 0);
 }
 
 static size_t cxip_rxc_get_num_events(struct cxip_rxc *rxc)
@@ -285,6 +113,75 @@ static size_t cxip_rxc_get_num_events(struct cxip_rxc *rxc)
 }
 
 /*
+ * rxc_msg_init() - Initialize an RX context for messaging.
+ *
+ * Allocates and initializes hardware resources used for receiving expected and
+ * unexpected message data.
+ *
+ * Caller must hold ep_obj->lock.
+ */
+static int rxc_msg_init(struct cxip_rxc *rxc)
+{
+	size_t num_events;
+	int ret;
+
+	/* Base message initialization */
+	num_events = cxip_rxc_get_num_events(rxc);
+	ret = cxip_evtq_init(&rxc->rx_evtq, rxc->recv_cq, num_events, 1);
+	if (ret) {
+		CXIP_WARN("Failed to initialize RXC event queue: %d, %s\n",
+			  ret, fi_strerror(-ret));
+		return ret;
+	}
+
+	ret = cxip_ep_cmdq(rxc->ep_obj, false, FI_TC_UNSPEC, rxc->rx_evtq.eq,
+			   &rxc->rx_cmdq);
+	if (ret != FI_SUCCESS) {
+		CXIP_WARN("Unable to allocate RX CMDQ, ret: %d\n", ret);
+		goto free_evtq;
+	}
+
+	/* Derived messaging initialization/overrides */
+	ret = rxc->ops.msg_init(rxc);
+	if (ret) {
+		CXIP_WARN("RXC derived initialization failed %d\n", ret);
+		goto put_rx_cmdq;
+	}
+
+	return FI_SUCCESS;
+
+put_rx_cmdq:
+	cxip_ep_cmdq_put(rxc->ep_obj, false);
+free_evtq:
+	cxip_evtq_fini(&rxc->rx_evtq);
+
+	return ret;
+}
+
+/*
+ * rxc_msg_fini() - Finalize RX context messaging.
+ *
+ * Free hardware resources allocated when the RX context was initialized for
+ * messaging.
+ *
+ * Caller must hold ep_obj->lock.
+ */
+static int rxc_msg_fini(struct cxip_rxc *rxc)
+{
+	int ret;
+
+	ret = rxc->ops.msg_fini(rxc);
+	if (ret)
+		return ret;
+
+	cxip_pte_free(rxc->rx_pte);
+	cxip_ep_cmdq_put(rxc->ep_obj, false);
+	cxip_evtq_fini(&rxc->rx_evtq);
+
+	return FI_SUCCESS;
+}
+
+/*
  * cxip_rxc_enable() - Enable an RX context for use.
  *
  * Called via fi_enable(). The context could be used in a standard endpoint or
@@ -293,9 +190,6 @@ static size_t cxip_rxc_get_num_events(struct cxip_rxc *rxc)
 int cxip_rxc_enable(struct cxip_rxc *rxc)
 {
 	int ret;
-	int tmp;
-	size_t num_events;
-	enum c_ptlte_state state;
 
 	if (rxc->state != RXC_DISABLED)
 		return FI_SUCCESS;
@@ -310,94 +204,30 @@ int cxip_rxc_enable(struct cxip_rxc *rxc)
 		return -FI_ENOCQ;
 	}
 
-	num_events = cxip_rxc_get_num_events(rxc);
-	ret = cxip_evtq_init(&rxc->rx_evtq, rxc->recv_cq, num_events, 1);
-	if (ret) {
-		CXIP_WARN("Failed to initialize RXC event queue: %d, %s\n",
-			  ret, fi_strerror(-ret));
-		return ret;
-	}
-
 	ret = rxc_msg_init(rxc);
 	if (ret != FI_SUCCESS) {
 		CXIP_WARN("rxc_msg_init returned: %d\n", ret);
-		ret = -FI_EDOMAIN;
-		goto evtq_fini;
+		return -FI_EDOMAIN;
 	}
-
-	/* If starting in or able to transition to software managed
-	 * PtlTE, append request list entries first.
-	 */
-	if (cxip_software_pte_allowed()) {
-		ret = cxip_req_bufpool_init(rxc);
-		if (ret != FI_SUCCESS)
-			goto err_msg_fini;
-	}
-
-	if (rxc->msg_offload) {
-		state = C_PTLTE_ENABLED;
-		ret = cxip_oflow_bufpool_init(rxc);
-		if (ret != FI_SUCCESS)
-			goto err_req_buf_fini;
-	} else {
-		state = C_PTLTE_SOFTWARE_MANAGED;
-	}
-
-	/* Start accepting Puts. */
-	ret = cxip_pte_set_state(rxc->rx_pte, rxc->rx_cmdq, state, 0);
-	if (ret != FI_SUCCESS) {
-		CXIP_WARN("cxip_pte_set_state returned: %d\n", ret);
-		goto err_oflow_buf_fini;
-	}
-
-	/* Wait for PTE state change */
-	do {
-		sched_yield();
-		cxip_evtq_progress(&rxc->rx_evtq);
-	} while (rxc->rx_pte->state != state);
-
-	rxc->pid_bits = rxc->domain->iface->dev->info.pid_bits;
-	CXIP_DBG("RXC messaging enabled: %p, pid_bits: %d\n",
-		 rxc, rxc->pid_bits);
 
 	return FI_SUCCESS;
-
-err_oflow_buf_fini:
-	if (rxc->msg_offload)
-		cxip_oflow_bufpool_fini(rxc);
-
-err_req_buf_fini:
-	if (cxip_software_pte_allowed())
-		cxip_req_bufpool_fini(rxc);
-
-err_msg_fini:
-	tmp = rxc_msg_fini(rxc);
-	if (tmp != FI_SUCCESS)
-		CXIP_WARN("rxc_msg_fini returned: %d\n", tmp);
-
-evtq_fini:
-	cxip_evtq_fini(&rxc->rx_evtq);
-
-	return ret;
 }
 
 /*
- * rxc_cleanup() - Attempt to free outstanding requests.
+ * cxip_rxc_recv_req_cleanup() - Attempt to free outstanding requests.
  *
  * Outstanding commands may be dropped when the RX Command Queue is freed.
  * This leads to missing events. Attempt to gather all events before freeing
  * the RX CQ. If events go missing, resources will be leaked until the
  * Completion Queue is freed.
  */
-static void rxc_cleanup(struct cxip_rxc *rxc)
+void cxip_rxc_recv_req_cleanup(struct cxip_rxc *rxc)
 {
 	int ret;
 	uint64_t start;
 	int canceled = 0;
-	struct cxip_fc_drops *fc_drops;
-	struct dlist_entry *tmp;
 
-	if (!ofi_atomic_get32(&rxc->orx_reqs))
+	if (!cxip_rxc_orx_reqs_get(rxc))
 		return;
 
 	cxip_evtq_req_discard(&rxc->rx_evtq, rxc);
@@ -412,7 +242,7 @@ static void rxc_cleanup(struct cxip_rxc *rxc)
 		CXIP_DBG("Canceled %d Receives: %p\n", canceled, rxc);
 
 	start = ofi_gettime_ms();
-	while (ofi_atomic_get32(&rxc->orx_reqs)) {
+	while (cxip_rxc_orx_reqs_get(rxc)) {
 		sched_yield();
 		cxip_evtq_progress(&rxc->rx_evtq);
 
@@ -421,22 +251,6 @@ static void rxc_cleanup(struct cxip_rxc *rxc)
 			break;
 		}
 	}
-
-	dlist_foreach_container_safe(&rxc->fc_drops, struct cxip_fc_drops,
-				     fc_drops, rxc_entry, tmp) {
-		dlist_remove(&fc_drops->rxc_entry);
-		free(fc_drops);
-	}
-
-	if (rxc->num_fc_eq_full || rxc->num_fc_no_match ||
-	    rxc->num_fc_req_full || rxc->num_fc_unexp ||
-	    rxc->num_fc_append_fail || rxc->num_sc_nic_hw2sw_unexp ||
-	    rxc->num_sc_nic_hw2sw_append_fail)
-		CXIP_INFO(CXIP_SC_STATS, rxc->num_fc_eq_full,
-			  rxc->num_fc_append_fail, rxc->num_fc_no_match,
-			  rxc->num_fc_req_full, rxc->num_fc_unexp,
-			  rxc->num_sc_nic_hw2sw_unexp,
-			  rxc->num_sc_nic_hw2sw_append_fail);
 }
 
 static void cxip_rxc_dump_counters(struct cxip_rxc *rxc)
@@ -478,44 +292,6 @@ static void cxip_rxc_dump_counters(struct cxip_rxc *rxc)
 	}
 }
 
-void cxip_rxc_struct_init(struct cxip_rxc *rxc, const struct fi_rx_attr *attr,
-			  void *context)
-{
-	int i;
-
-	dlist_init(&rxc->ep_list);
-	ofi_atomic_initialize32(&rxc->orx_hw_ule_cnt, 0);
-	ofi_atomic_initialize32(&rxc->orx_reqs, 0);
-	ofi_atomic_initialize32(&rxc->orx_tx_reqs, 0);
-	rxc->max_tx = cxip_env.sw_rx_tx_init_max;
-
-	rxc->context = context;
-	rxc->attr = *attr;
-
-	for (i = 0; i < CXIP_DEF_EVENT_HT_BUCKETS; i++)
-		dlist_init(&rxc->deferred_events.bh[i]);
-
-	dlist_init(&rxc->fc_drops);
-	dlist_init(&rxc->replay_queue);
-	dlist_init(&rxc->sw_ux_list);
-	dlist_init(&rxc->sw_recv_queue);
-	dlist_init(&rxc->sw_pending_ux_list);
-
-	rxc->max_eager_size = cxip_env.rdzv_threshold + cxip_env.rdzv_get_min;
-	rxc->drop_count = rxc->ep_obj->asic_ver < CASSINI_2_0 ? -1 : 0;
-
-	/* TODO make configurable */
-	rxc->min_multi_recv = CXIP_EP_MIN_MULTI_RECV;
-	rxc->state = RXC_DISABLED;
-	rxc->msg_offload = cxip_env.msg_offload;
-	rxc->hmem = !!(attr->caps & FI_HMEM);
-	rxc->sw_ep_only = cxip_env.rx_match_mode == CXIP_PTLTE_SOFTWARE_MODE;
-	rxc->rget_align_mask = cxip_env.rdzv_aligned_sw_rget ?
-					cxip_env.cacheline_size - 1 : 0;
-
-	cxip_msg_counters_init(&rxc->cntrs);
-}
-
 /*
  * cxip_rxc_disable() - Disable the RX context of an base endpoint object.
  *
@@ -537,15 +313,8 @@ void cxip_rxc_disable(struct cxip_rxc *rxc)
 		if (ret != FI_SUCCESS)
 			CXIP_WARN("rxc_msg_disable returned: %d\n", ret);
 
-		cxip_rxc_free_ux_entries(rxc);
-
-		rxc_cleanup(rxc);
-
-		if (cxip_software_pte_allowed())
-			cxip_req_bufpool_fini(rxc);
-
-		if (cxip_env.msg_offload)
-			cxip_oflow_bufpool_fini(rxc);
+		/* Protocol cleanup must call cxip_rxc_recv_req_cleanup() */
+		rxc->ops.cleanup(rxc);
 
 		/* Free hardware resources. */
 		ret = rxc_msg_fini(rxc);
@@ -554,17 +323,18 @@ void cxip_rxc_disable(struct cxip_rxc *rxc)
 	}
 }
 
-int cxip_rxc_emit_dma(struct cxip_rxc *rxc, uint16_t vni,
+int cxip_rxc_emit_dma(struct cxip_rxc_hpc *rxc, uint16_t vni,
 		      enum cxi_traffic_class tc,
 		      enum cxi_traffic_class_type tc_type,
 		      struct c_full_dma_cmd *dma, uint64_t flags)
 {
 	int ret;
 
-	if (rxc->ep_obj->av_auth_key) {
-		ret = cxip_domain_emit_dma(rxc->domain, vni, tc, dma, flags);
+	if (rxc->base.ep_obj->av_auth_key) {
+		ret = cxip_domain_emit_dma(rxc->base.domain, vni, tc,
+					   dma, flags);
 		if (ret)
-			TXC_WARN(rxc, "Failed to emit domain dma command: %d\n",
+			RXC_WARN(rxc, "Failed to emit domain dma command: %d\n",
 				 ret);
 		return ret;
 	}
@@ -589,7 +359,7 @@ int cxip_rxc_emit_dma(struct cxip_rxc *rxc, uint16_t vni,
 	return FI_SUCCESS;
 }
 
-int cxip_rxc_emit_idc_msg(struct cxip_rxc *rxc, uint16_t vni,
+int cxip_rxc_emit_idc_msg(struct cxip_rxc_hpc *rxc, uint16_t vni,
 			  enum cxi_traffic_class tc,
 			  enum cxi_traffic_class_type tc_type,
 			  const struct c_cstate_cmd *c_state,
@@ -598,9 +368,9 @@ int cxip_rxc_emit_idc_msg(struct cxip_rxc *rxc, uint16_t vni,
 {
 	int ret;
 
-	if (rxc->ep_obj->av_auth_key) {
-		ret = cxip_domain_emit_idc_msg(rxc->domain, vni, tc, c_state,
-					       msg, buf, len, flags);
+	if (rxc->base.ep_obj->av_auth_key) {
+		ret = cxip_domain_emit_idc_msg(rxc->base.domain, vni, tc,
+					       c_state, msg, buf, len, flags);
 		if (ret)
 			RXC_WARN(rxc, "Failed to emit domain idc msg: %d\n",
 				 ret);
@@ -626,4 +396,74 @@ int cxip_rxc_emit_idc_msg(struct cxip_rxc *rxc, uint16_t vni,
 	cxip_txq_ring(rxc->tx_cmdq, 0, 1);
 
 	return FI_SUCCESS;
+}
+
+struct cxip_rxc *cxip_rxc_calloc(struct cxip_ep_obj *ep_obj, void *context)
+{
+	struct cxip_rxc *rxc = NULL;
+
+	/* 
+	 * It's possible the owner provider decides to turn off
+	 * hardware offload in cxi. If that happens we need to update the
+	 * rx_match_mode.
+	 */
+	cxip_set_env_rx_match_mode();
+
+	switch (ep_obj->protocol) {
+	case FI_PROTO_CXI:
+		rxc = calloc(1, sizeof(struct cxip_rxc_hpc));
+		if (rxc)
+			rxc->ops = hpc_rxc_ops;
+		break;
+	case FI_PROTO_CXI_RNR:
+		rxc = calloc(1, sizeof(struct cxip_rxc_rnr));
+		if (rxc)
+			rxc->ops = rnr_rxc_ops;
+		break;
+	default:
+		CXIP_WARN("Unsupported EP protocol requested %d\n",
+			  ep_obj->protocol);
+		return NULL;
+	}
+
+	if (!rxc) {
+		CXIP_WARN("Memory allocation failure\n");
+		return NULL;
+	}
+
+	/* Base initialization */
+	rxc->protocol = ep_obj->protocol;
+	rxc->context = context;
+	rxc->ep_obj = ep_obj;
+	rxc->domain = ep_obj->domain;
+	rxc->min_multi_recv = CXIP_EP_MIN_MULTI_RECV;
+	rxc->state = RXC_DISABLED;
+	rxc->msg_offload = cxip_env.msg_offload;
+	rxc->max_tx = cxip_env.sw_rx_tx_init_max;
+	rxc->attr = ep_obj->rx_attr;
+	rxc->hmem = !!(rxc->attr.caps & FI_HMEM);
+	rxc->pid_bits = ep_obj->domain->iface->dev->info.pid_bits;
+	cxip_rxc_orx_reqs_init(rxc);
+
+	rxc->sw_ep_only = cxip_env.rx_match_mode ==
+					CXIP_PTLTE_SOFTWARE_MODE;
+	cxip_msg_counters_init(&rxc->cntrs);
+
+	/* Derived initialization/overrides */
+	rxc->ops.init_struct(rxc, ep_obj);
+
+	return rxc;
+}
+
+void cxip_rxc_free(struct cxip_rxc *rxc)
+{
+	if (!rxc)
+		return;
+
+	/* Derived structure free */
+	rxc->ops.fini_struct(rxc);
+
+	/* Any base stuff */
+
+	free(rxc);
 }
